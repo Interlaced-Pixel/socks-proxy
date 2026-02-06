@@ -254,6 +254,51 @@ static int test_observability(void) {
     return 0;
 }
 
+static int test_auth_fragmented(void) {
+    // Start server with auth required
+    char *args[] = {SERVER_BIN, "--port", "1106", "--user", "user:pass", NULL};
+    pid_t pid = start_server((char *const *)args, NULL);
+    int port = 1106;
+    if (!wait_for_port(port, 2)) { stop_server(pid); fprintf(stderr, "Server failed to start\n"); return 1; }
+
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { stop_server(pid); fprintf(stderr, "socket failed\n"); return 1; }
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET; sa.sin_port = htons(port); inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    struct timeval tv = {SOCKS5_TIMEOUT, 0};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(s, (struct sockaddr*)&sa, sizeof(sa)) != 0) { close(s); stop_server(pid); fprintf(stderr, "connect failed\n"); return 1; }
+
+    // Fragmented greeting: 0x05 | 0x01 | 0x02
+    unsigned char b;
+    b = 0x05; send(s, &b, 1, 0); usleep(10000);
+    b = 0x01; send(s, &b, 1, 0); usleep(10000);
+    b = 0x02; send(s, &b, 1, 0);
+
+    unsigned char rep[2];
+    if (recv(s, rep, 2, 0) != 2) { close(s); stop_server(pid); fprintf(stderr, "no method reply\n"); return 1; }
+    if (rep[0] != 0x05 || rep[1] != 0x02) { close(s); stop_server(pid); fprintf(stderr, "unexpected method %02x %02x\n", rep[0], rep[1]); return 1; }
+
+    // Fragmented RFC1929: ver(1)=0x01, ulen(1)=4, user="user", plen(1)=4, pass="pass"
+    const char *user = "user"; const char *pass = "pass";
+    b = 0x01; send(s, &b, 1, 0); usleep(5000);
+    b = 0x04; send(s, &b, 1, 0); usleep(5000);
+    send(s, user, 1, 0); usleep(5000);
+    send(s, user + 1, 2, 0); usleep(5000);
+    send(s, user + 3, 1, 0); usleep(5000);
+    b = 0x04; send(s, &b, 1, 0); usleep(5000);
+    send(s, pass, 2, 0); usleep(5000);
+    send(s, pass + 2, 2, 0);
+
+    unsigned char arep[2];
+    if (recv(s, arep, 2, 0) != 2) { close(s); stop_server(pid); fprintf(stderr, "no auth reply\n"); return 1; }
+    if (arep[0] != 0x01 || arep[1] != 0x00) { close(s); stop_server(pid); fprintf(stderr, "auth fail %02x %02x\n", arep[0], arep[1]); return 1; }
+
+    close(s);
+    stop_server(pid);
+    return 0;
+}
+
 static int test_max_conn(void) {
     char *args[] = {SERVER_BIN, "--port", "1110", "--max-conn", "1", NULL};
     pid_t pid = start_server((char *const *)args, NULL);
@@ -420,6 +465,7 @@ int main(void) {
         {"Auth Success", (int(*)(void))test_auth_success},
         {"Auth Fail", (int(*)(void))test_auth_failure},
         {"Auth Enforced", (int(*)(void))test_auth_required_header_check},
+        {"Auth Fragmented", (int(*)(void))test_auth_fragmented},
         {"Version Flag", (int(*)(void))test_version_flag},
         {"Mixed Flags (NoAuth)", (int(*)(void))test_no_auth},
         {"Observability Values", (int(*)(void))test_observability},

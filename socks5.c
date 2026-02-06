@@ -368,6 +368,20 @@ typedef struct {
   time_t start_time;
 } socks5_session;
 
+// Read exactly len bytes into buf or fail. Returns 0 on success, -1 on error.
+static int read_exact(socks5_socket s, void *buf, size_t len) {
+  uint8_t *p = (uint8_t *)buf;
+  size_t off = 0;
+  while (off < len) {
+    ssize_t n = recv(s, (char *)p + off, (int)(len - off), 0);
+    if (n <= 0) {
+      return -1;
+    }
+    off += (size_t)n;
+  }
+  return 0;
+}
+
 static void socks5_handle_client(void *arg) {
   socks5_session *session = (socks5_session *)arg;
   socks5_server *server = session->server;
@@ -402,14 +416,16 @@ static void socks5_handle_client(void *arg) {
   uint8_t buf[512];
 
   // 1. Handshake
-  if (recv(client_sock, (char *)buf, 2, 0) <= 0)
+  if (read_exact(client_sock, buf, 2) != 0)
     goto cleanup;
 
   if (buf[0] != SOCKS5_VERSION)
     goto cleanup;
 
   int nmethods = buf[1];
-  if (recv(client_sock, (char *)buf, nmethods, 0) <= 0)
+  if (nmethods <= 0 || nmethods > (int)sizeof(buf))
+    goto cleanup;
+  if (read_exact(client_sock, buf, (size_t)nmethods) != 0)
     goto cleanup;
 
   int selected_method = SOCKS5_AUTH_NO_ACCEPTABLE;
@@ -432,19 +448,25 @@ static void socks5_handle_client(void *arg) {
 
   // 2. Auth
   if (selected_method == SOCKS5_AUTH_USER_PASS) {
-    if (recv(client_sock, (char *)buf, 2, 0) <= 0)
+    if (read_exact(client_sock, buf, 2) != 0)
+      goto cleanup;
+    if (buf[0] != 0x01) // RFC 1929 version
       goto cleanup;
     uint8_t ulen = buf[1];
+    if (ulen == 0 || ulen > 255)
+      goto cleanup;
     char username[256];
-    if (recv(client_sock, username, ulen, 0) <= 0)
+    if (read_exact(client_sock, username, ulen) != 0)
       goto cleanup;
     username[ulen] = '\0';
 
-    if (recv(client_sock, (char *)buf, 1, 0) <= 0)
+    if (read_exact(client_sock, buf, 1) != 0)
       goto cleanup;
     uint8_t plen = buf[0];
+    if (plen > 255)
+      goto cleanup;
     char password[256];
-    if (recv(client_sock, password, plen, 0) <= 0)
+    if (read_exact(client_sock, password, plen) != 0)
       goto cleanup;
     password[plen] = '\0';
 
@@ -461,15 +483,19 @@ static void socks5_handle_client(void *arg) {
   }
 
   // 3. Request
-  if (recv(client_sock, (char *)buf, 4, 0) <= 0)
+  if (read_exact(client_sock, buf, 4) != 0)
     goto cleanup;
 
+  if (buf[0] != SOCKS5_VERSION)
+    goto cleanup;
   uint8_t cmd = buf[1];
 
   if (buf[1] != SOCKS5_CMD_CONNECT && buf[1] != SOCKS5_CMD_BIND &&
       buf[1] != SOCKS5_CMD_UDP_ASSOCIATE) {
     buf[1] = SOCKS5_REPLY_COMMAND_NOT_SUPPORTED;
-    send(client_sock, (char *)buf, 4, 0);
+    // Send minimal failure reply frame
+    uint8_t rep[10] = {SOCKS5_VERSION, SOCKS5_REPLY_COMMAND_NOT_SUPPORTED, 0x00, SOCKS5_ADDR_IPV4, 0,0,0,0, 0,0};
+    send(client_sock, (char *)rep, 10, 0);
     goto cleanup;
   }
 
@@ -478,27 +504,31 @@ static void socks5_handle_client(void *arg) {
   uint16_t dst_port;
 
   if (atyp == SOCKS5_ADDR_IPV4) {
-    if (recv(client_sock, (char *)buf, 4, 0) <= 0)
+    if (read_exact(client_sock, buf, 4) != 0)
       goto cleanup;
     inet_ntop(AF_INET, buf, dst_addr, sizeof(dst_addr));
   } else if (atyp == SOCKS5_ADDR_DOMAINNAME) {
-    if (recv(client_sock, (char *)buf, 1, 0) <= 0)
+    if (read_exact(client_sock, buf, 1) != 0)
       goto cleanup;
     uint8_t len = buf[0];
-    if (recv(client_sock, dst_addr, len, 0) <= 0)
+    if (len == 0)
+      goto cleanup;
+    if (read_exact(client_sock, dst_addr, len) != 0)
       goto cleanup;
     dst_addr[len] = '\0';
   } else if (atyp == SOCKS5_ADDR_IPV6) {
-    if (recv(client_sock, (char *)buf, 16, 0) <= 0)
+    if (read_exact(client_sock, buf, 16) != 0)
       goto cleanup;
     inet_ntop(AF_INET6, buf, dst_addr, sizeof(dst_addr));
   } else {
     goto cleanup;
   }
 
-  if (recv(client_sock, (char *)buf, 2, 0) <= 0)
+  if (read_exact(client_sock, buf, 2) != 0)
     goto cleanup;
-  dst_port = ntohs(*(uint16_t *)buf);
+  uint16_t port_n;
+  memcpy(&port_n, buf, 2);
+  dst_port = ntohs(port_n);
 
   socks5_socket remote_sock = SOCKS5_INVALID_SOCKET;
 
