@@ -126,6 +126,8 @@ typedef struct {
   int max_connections;
   char **allow_ips;
   int allow_ip_count;
+  // Logging
+  bool debug;
 } socks5_config;
 
 struct socks5_server {
@@ -195,6 +197,8 @@ static bool simple_auth_cb(void *ctx, const char *username,
 static void socks5_log(const socks5_server *server, socks5_log_level level,
                        const char *fmt, ...) {
   if (!server->config.log_cb)
+    return;
+  if (level == SOCKS5_LOG_DEBUG && !server->config.debug)
     return;
 
   char buf[1024];
@@ -427,6 +431,15 @@ static void socks5_handle_client(void *arg) {
     goto cleanup;
   if (read_exact(client_sock, buf, (size_t)nmethods) != 0)
     goto cleanup;
+  socks5_log(server, SOCKS5_LOG_DEBUG, "Handshake: ver=0x%02x nmethods=%d", SOCKS5_VERSION, nmethods);
+  {
+    char mlist[256];
+    int w = 0;
+    for (int i = 0; i < nmethods && w < (int)sizeof(mlist)-4; i++) {
+      w += snprintf(mlist + w, sizeof(mlist) - (size_t)w, "%s0x%02x", (i?",":""), buf[i]);
+    }
+    socks5_log(server, SOCKS5_LOG_DEBUG, "Methods: [%s]", mlist);
+  }
 
   int selected_method = SOCKS5_AUTH_NO_ACCEPTABLE;
   for (int i = 0; i < nmethods; i++) {
@@ -438,6 +451,7 @@ static void socks5_handle_client(void *arg) {
       break;
     }
   }
+  socks5_log(server, SOCKS5_LOG_DEBUG, "Selected method: 0x%02x", selected_method);
 
   buf[0] = SOCKS5_VERSION;
   buf[1] = (uint8_t)selected_method;
@@ -470,6 +484,8 @@ static void socks5_handle_client(void *arg) {
       goto cleanup;
     password[plen] = '\0';
 
+    socks5_log(server, SOCKS5_LOG_DEBUG, "Auth request: user='%s' ulen=%u plen=%u", username, (unsigned)ulen, (unsigned)plen);
+
     bool authenticated = false;
     if (server->config.auth_cb)
       authenticated = server->config.auth_cb(server, username, password);
@@ -479,7 +495,11 @@ static void socks5_handle_client(void *arg) {
     send(client_sock, (char *)buf, 2, 0);
 
     if (!authenticated)
-      goto cleanup;
+      socks5_log(server, SOCKS5_LOG_DEBUG, "Auth result: FAIL for user '%s'", username);
+    else
+      socks5_log(server, SOCKS5_LOG_DEBUG, "Auth result: SUCCESS for user '%s'", username);
+
+    goto cleanup;
   }
 
   // 3. Request
@@ -489,6 +509,8 @@ static void socks5_handle_client(void *arg) {
   if (buf[0] != SOCKS5_VERSION)
     goto cleanup;
   uint8_t cmd = buf[1];
+  uint8_t atyp = buf[3];
+  socks5_log(server, SOCKS5_LOG_DEBUG, "Request: cmd=0x%02x atyp=0x%02x", cmd, atyp);
 
   if (buf[1] != SOCKS5_CMD_CONNECT && buf[1] != SOCKS5_CMD_BIND &&
       buf[1] != SOCKS5_CMD_UDP_ASSOCIATE) {
@@ -499,7 +521,6 @@ static void socks5_handle_client(void *arg) {
     goto cleanup;
   }
 
-  uint8_t atyp = buf[3];
   char dst_addr[256];
   uint16_t dst_port;
 
@@ -549,6 +570,7 @@ static void socks5_handle_client(void *arg) {
         if (connect(remote_sock, res->ai_addr, (int)res->ai_addrlen) != 0) {
           socks5_socket_close(remote_sock);
           remote_sock = SOCKS5_INVALID_SOCKET;
+          socks5_log(server, SOCKS5_LOG_DEBUG, "CONNECT failed to %s:%u errno=%d", dst_addr, dst_port, SOCKS5_SOCKET_ERRNO);
         }
       }
       freeaddrinfo(res);
@@ -1159,6 +1181,7 @@ static void print_usage(const char *prog) {
   printf(
       "  --max-conn <n>              Max concurrent connections (default: 100)\n");
   printf("  --allow-ip <ip>          Allow only specific IP (can be used multiple times)\n");
+  printf("  -d, --debug              Enable verbose debug logging\n");
   printf("  --install <mode>         Install the service (mode: systemd/service)\n");
   printf("  --uninstall <mode>       Uninstall the service (mode: systemd/service)\n");
   printf("  -h, --help               Show this help message\n");
@@ -1220,6 +1243,7 @@ int main(int argc, char **argv) {
   config.port = 1080;
   config.log_cb = logger;
   config.bind_address = "0.0.0.0";
+  config.debug = false;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -1424,6 +1448,8 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--allow-ip") == 0) {
       if (++i < argc)
         socks5_add_allow_ip(&config, argv[i]);
+    } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+      config.debug = true;
     } else {
       // Backward compatibility: first arg is port if not a flag
       if (i == 1 && argv[i][0] != '-') {
