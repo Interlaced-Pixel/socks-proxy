@@ -299,6 +299,58 @@ static int test_auth_fragmented(void) {
     return 0;
 }
 
+static int test_request_fragmented(void) {
+    // Start server with no auth
+    char *args[] = {SERVER_BIN, "--port", "1107", NULL};
+    pid_t pid = start_server((char *const *)args, NULL);
+    int port = 1107;
+    if (!wait_for_port(port, 2)) { stop_server(pid); fprintf(stderr, "Server failed to start\n"); return 1; }
+
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { stop_server(pid); fprintf(stderr, "socket failed\n"); return 1; }
+    struct sockaddr_in sa = {0}; sa.sin_family = AF_INET; sa.sin_port = htons(port); inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    struct timeval tv = {SOCKS5_TIMEOUT, 0}; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(s, (struct sockaddr*)&sa, sizeof(sa)) != 0) { close(s); stop_server(pid); fprintf(stderr, "connect failed\n"); return 1; }
+
+    // Greeting: 0x05 0x01 0x00
+    unsigned char gr[3] = {0x05, 0x01, 0x00};
+    // Send greeting in two pieces
+    send(s, gr, 2, 0); usleep(5000);
+    send(s, gr + 2, 1, 0);
+
+    unsigned char mrep[2];
+    if (recv(s, mrep, 2, 0) != 2) { close(s); stop_server(pid); fprintf(stderr, "no method reply\n"); return 1; }
+    if (mrep[0] != 0x05 || mrep[1] != 0x00) { close(s); stop_server(pid); fprintf(stderr, "unexpected method %02x %02x\n", mrep[0], mrep[1]); return 1; }
+
+    // Fragmented CONNECT request to 127.0.0.1:1234
+    unsigned char req[10];
+    req[0]=0x05; req[1]=0x01; req[2]=0x00; req[3]=0x01; // VER, CMD, RSV, ATYP=IPv4
+    inet_pton(AF_INET, "127.0.0.1", req + 4);
+    *(uint16_t*)(req + 8) = htons(1234);
+
+    // Send in multiple chunks
+    send(s, req, 1, 0); usleep(3000);
+    send(s, req + 1, 2, 0); usleep(3000);
+    send(s, req + 3, 1, 0); usleep(3000);
+    send(s, req + 4, 1, 0); usleep(3000);
+    send(s, req + 5, 2, 0); usleep(3000);
+    send(s, req + 7, 1, 0); usleep(3000);
+    send(s, req + 8, 1, 0); usleep(3000);
+    send(s, req + 9, 1, 0);
+
+    // Read reply (try upto 10 bytes, but require at least 2)
+    unsigned char rep[10];
+    ssize_t n = recv(s, rep, sizeof(rep), 0);
+    close(s);
+    stop_server(pid);
+    if (n < 2) { fprintf(stderr, "CONNECT reply too short (%zd)\n", n); return 1; }
+    int r = rep[1];
+    // Accept success or common failure codes (depends on local environment)
+    if (r == 0x00 || r == 0x01 || r == 0x03 || r == 0x04) return 0;
+    fprintf(stderr, "Unexpected CONNECT reply code: %d\n", r);
+    return 1;
+}
+
 static int test_max_conn(void) {
     char *args[] = {SERVER_BIN, "--port", "1110", "--max-conn", "1", NULL};
     pid_t pid = start_server((char *const *)args, NULL);
@@ -466,6 +518,7 @@ int main(void) {
         {"Auth Fail", (int(*)(void))test_auth_failure},
         {"Auth Enforced", (int(*)(void))test_auth_required_header_check},
         {"Auth Fragmented", (int(*)(void))test_auth_fragmented},
+        {"CONNECT Fragmented", (int(*)(void))test_request_fragmented},
         {"Version Flag", (int(*)(void))test_version_flag},
         {"Mixed Flags (NoAuth)", (int(*)(void))test_no_auth},
         {"Observability Values", (int(*)(void))test_observability},

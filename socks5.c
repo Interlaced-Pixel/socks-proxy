@@ -30,8 +30,8 @@
 // Program version (semantic versioning)
 #define SOCKS5_VERSION_MAJOR 0
 #define SOCKS5_VERSION_MINOR 1
-#define SOCKS5_VERSION_PATCH 0
-#define SOCKS5_VERSION_STR "0.1.0"
+#define SOCKS5_VERSION_PATCH 1
+#define SOCKS5_VERSION_STR "0.1.1"
 
 // Authentication methods
 #define SOCKS5_AUTH_NONE 0x00
