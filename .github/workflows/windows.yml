@@ -1,0 +1,30 @@
+name: CI (Windows)
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up MSYS2 and install build tools
+      uses: msys2/setup-msys2@v2
+      with:
+        update: true
+        install: |
+          base-devel
+          mingw-w64-x86_64-toolchain
+
+    - name: Build (MSYS2)
+      run: make
+      shell: msys2 {0}
+
+    - name: Run tests (C)
+      run: make check
+      shell: msys2 {0}
