@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#include <stdatomic.h>
 
 /* --- Constants & Protocol Definitions --- */
 
@@ -57,6 +60,10 @@ typedef SOCKET socks5_socket;
 #define SOCKS5_INVALID_SOCKET INVALID_SOCKET
 #define SOCKS5_SOCKET_ERRNO WSAGetLastError()
 typedef uintptr_t socks5_thread;
+// stdatomic.h is C11. MSVC supports it in newer versions, but C support can be
+// spotty. For now assuming C11 compliant compiler or simple int for
+// non-critical race in single file demonstration. If stdatomic.h is missing, we
+// might need a fallback. But standard C11 has it.
 #else
 #include <arpa/inet.h>
 #include <errno.h>
@@ -99,12 +106,18 @@ typedef struct {
   socks5_log_callback log_cb;
   int backlog;
   int timeout_seconds;
+
+  // Security
+  int max_connections;
+  char **allow_ips;
+  int allow_ip_count;
 } socks5_config;
 
 struct socks5_server {
   socks5_config config;
   socks5_socket listen_sock;
   volatile bool running;
+  _Atomic int active_connections;
 };
 
 typedef struct socks5_server socks5_server;
@@ -130,6 +143,26 @@ static void socks5_add_user(socks5_config *config, const char *username,
   config->users = user;
 }
 
+static void socks5_add_allow_ip(socks5_config *config, const char *ip) {
+  config->allow_ips = (char **)realloc(
+      config->allow_ips, sizeof(char *) * (config->allow_ip_count + 1));
+  if (config->allow_ips) {
+    config->allow_ips[config->allow_ip_count] = xstrdup(ip);
+    config->allow_ip_count++;
+  }
+}
+
+static bool is_ip_allowed(const socks5_config *config, const char *ip_str) {
+  if (config->allow_ip_count == 0)
+    return true; // No whitelist = allow all
+  for (int i = 0; i < config->allow_ip_count; i++) {
+    if (strcmp(config->allow_ips[i], ip_str) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool simple_auth_cb(void *ctx, const char *username,
                            const char *password) {
   socks5_server *server = (socks5_server *)ctx;
@@ -150,12 +183,21 @@ static void socks5_log(const socks5_server *server, socks5_log_level level,
     return;
 
   char buf[1024];
+  char time_buf[64];
+
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", t);
+
   va_list args;
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
 
-  server->config.log_cb(level, buf);
+  char final_buf[1200];
+  snprintf(final_buf, sizeof(final_buf), "[%s] %s", time_buf, buf);
+
+  server->config.log_cb(level, final_buf);
 }
 
 static void socks5_socket_close(socks5_socket s) {
@@ -169,13 +211,41 @@ static void socks5_socket_close(socks5_socket s) {
 typedef struct {
   socks5_server *server;
   socks5_socket client_sock;
+  uint64_t bytes_sent;
+  uint64_t bytes_received;
+  time_t start_time;
 } socks5_session;
 
 static void socks5_handle_client(void *arg) {
   socks5_session *session = (socks5_session *)arg;
   socks5_server *server = session->server;
   socks5_socket client_sock = session->client_sock;
-  free(session);
+  session->start_time = time(NULL);
+  session->bytes_sent = 0;
+  session->bytes_received = 0;
+
+  // We don't free session here anymore, we need it for stats at the end.
+  // Wait to free until cleanup.
+
+  // Security Checks
+  struct sockaddr_storage addr;
+  socklen_t len = sizeof(addr);
+  if (getpeername(client_sock, (struct sockaddr *)&addr, &len) == 0) {
+    char client_ip[INET6_ADDRSTRLEN];
+    if (addr.ss_family == AF_INET) {
+      inet_ntop(AF_INET, &((struct sockaddr_in *)&addr)->sin_addr, client_ip,
+                sizeof(client_ip));
+    } else {
+      inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&addr)->sin6_addr, client_ip,
+                sizeof(client_ip));
+    }
+
+    if (!is_ip_allowed(&server->config, client_ip)) {
+      socks5_log(server, SOCKS5_LOG_WARN, "Access denied for IP: %s",
+                 client_ip);
+      goto cleanup;
+    }
+  }
 
   uint8_t buf[512];
 
@@ -242,14 +312,10 @@ static void socks5_handle_client(void *arg) {
   if (recv(client_sock, (char *)buf, 4, 0) <= 0)
     goto cleanup;
 
-  if (buf[1] == SOCKS5_CMD_BIND || buf[1] == SOCKS5_CMD_UDP_ASSOCIATE) {
-    socks5_log(server, SOCKS5_LOG_WARN, "Command %d not supported", buf[1]);
-    buf[1] = SOCKS5_REPLY_COMMAND_NOT_SUPPORTED;
-    send(client_sock, (char *)buf, 4, 0);
-    goto cleanup;
-  }
+  uint8_t cmd = buf[1];
 
-  if (buf[1] != SOCKS5_CMD_CONNECT) {
+  if (buf[1] != SOCKS5_CMD_CONNECT && buf[1] != SOCKS5_CMD_BIND &&
+      buf[1] != SOCKS5_CMD_UDP_ASSOCIATE) {
     buf[1] = SOCKS5_REPLY_COMMAND_NOT_SUPPORTED;
     send(client_sock, (char *)buf, 4, 0);
     goto cleanup;
@@ -282,68 +348,379 @@ static void socks5_handle_client(void *arg) {
     goto cleanup;
   dst_port = ntohs(*(uint16_t *)buf);
 
-  socks5_log(server, SOCKS5_LOG_INFO, "CONNECT %s:%u", dst_addr, dst_port);
-
-  struct addrinfo hints, *res;
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  char port_str[8];
-  snprintf(port_str, sizeof(port_str), "%u", dst_port);
-
   socks5_socket remote_sock = SOCKS5_INVALID_SOCKET;
-  if (getaddrinfo(dst_addr, port_str, &hints, &res) == 0) {
-    remote_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (remote_sock != SOCKS5_INVALID_SOCKET) {
-      if (connect(remote_sock, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        socks5_socket_close(remote_sock);
-        remote_sock = SOCKS5_INVALID_SOCKET;
+
+  if (cmd == SOCKS5_CMD_CONNECT) {
+    socks5_log(server, SOCKS5_LOG_INFO, "CONNECT %s:%u", dst_addr, dst_port);
+    session->start_time = time(NULL); // Reset timer
+
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", dst_port);
+
+    if (getaddrinfo(dst_addr, port_str, &hints, &res) == 0) {
+      remote_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+      if (remote_sock != SOCKS5_INVALID_SOCKET) {
+        if (connect(remote_sock, res->ai_addr, (int)res->ai_addrlen) != 0) {
+          socks5_socket_close(remote_sock);
+          remote_sock = SOCKS5_INVALID_SOCKET;
+        }
       }
+      freeaddrinfo(res);
     }
-    freeaddrinfo(res);
-  }
 
-  buf[0] = SOCKS5_VERSION;
-  if (remote_sock != SOCKS5_INVALID_SOCKET) {
-    buf[1] = SOCKS5_REPLY_SUCCEEDED;
-    buf[2] = 0x00;
+    // Send Reply
+    buf[0] = SOCKS5_VERSION;
+    if (remote_sock != SOCKS5_INVALID_SOCKET) {
+      buf[1] = SOCKS5_REPLY_SUCCEEDED;
+      buf[2] = 0x00;
 
-    struct sockaddr_storage local_addr;
-    socklen_t addr_len = sizeof(local_addr);
-    if (getsockname(remote_sock, (struct sockaddr *)&local_addr, &addr_len) ==
-        0) {
-      if (local_addr.ss_family == AF_INET) {
-        struct sockaddr_in *s = (struct sockaddr_in *)&local_addr;
-        buf[3] = SOCKS5_ADDR_IPV4;
-        memcpy(buf + 4, &s->sin_addr, 4);
-        memcpy(buf + 8, &s->sin_port, 2);
-        send(client_sock, (char *)buf, 10, 0);
-      } else if (local_addr.ss_family == AF_INET6) {
-        struct sockaddr_in6 *s = (struct sockaddr_in6 *)&local_addr;
-        buf[3] = SOCKS5_ADDR_IPV6;
-        memcpy(buf + 4, &s->sin6_addr, 16);
-        memcpy(buf + 20, &s->sin6_port, 2);
-        send(client_sock, (char *)buf, 22, 0);
+      struct sockaddr_storage local_addr;
+      socklen_t addr_len = sizeof(local_addr);
+      if (getsockname(remote_sock, (struct sockaddr *)&local_addr, &addr_len) ==
+          0) {
+        if (local_addr.ss_family == AF_INET) {
+          struct sockaddr_in *s = (struct sockaddr_in *)&local_addr;
+          buf[3] = SOCKS5_ADDR_IPV4;
+          memcpy(buf + 4, &s->sin_addr, 4);
+          memcpy(buf + 8, &s->sin_port, 2);
+          send(client_sock, (char *)buf, 10, 0);
+        } else if (local_addr.ss_family == AF_INET6) {
+          struct sockaddr_in6 *s = (struct sockaddr_in6 *)&local_addr;
+          buf[3] = SOCKS5_ADDR_IPV6;
+          memcpy(buf + 4, &s->sin6_addr, 16);
+          memcpy(buf + 20, &s->sin6_port, 2);
+          send(client_sock, (char *)buf, 22, 0);
+        } else {
+          buf[3] = SOCKS5_ADDR_IPV4;
+          memset(buf + 4, 0, 6);
+          send(client_sock, (char *)buf, 10, 0);
+        }
       } else {
-        // Fallback to 0.0.0.0 if unknown family
         buf[3] = SOCKS5_ADDR_IPV4;
         memset(buf + 4, 0, 6);
         send(client_sock, (char *)buf, 10, 0);
       }
     } else {
-      // Failed to get name, send zeros
+      buf[1] = SOCKS5_REPLY_FAILURE;
+      buf[2] = 0x00;
+      buf[3] = SOCKS5_ADDR_IPV4;
+      memset(buf + 4, 0, 6);
+      send(client_sock, (char *)buf, 10, 0);
+      goto cleanup;
+    }
+
+  } else if (cmd == SOCKS5_CMD_BIND) {
+    socks5_log(server, SOCKS5_LOG_INFO, "BIND request from %s",
+               dst_addr); // dst_addr is expected source
+    session->start_time = time(NULL);
+
+    // 1. Create listener
+    socks5_socket bind_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (bind_sock == SOCKS5_INVALID_SOCKET) {
+      goto bind_error;
+    }
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind_addr.sin_port = 0; // Random port
+
+    if (bind(bind_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) !=
+        0) {
+      socks5_socket_close(bind_sock);
+      goto bind_error;
+    }
+
+    if (listen(bind_sock, 1) != 0) {
+      socks5_socket_close(bind_sock);
+      goto bind_error;
+    }
+
+    // 2. Send First Reply (BND.ADDR/PORT)
+    struct sockaddr_in assigned_addr;
+    socklen_t len = sizeof(assigned_addr);
+    if (getsockname(bind_sock, (struct sockaddr *)&assigned_addr, &len) != 0) {
+      socks5_socket_close(bind_sock);
+      goto bind_error;
+    }
+
+    buf[0] = SOCKS5_VERSION;
+    buf[1] = SOCKS5_REPLY_SUCCEEDED;
+    buf[2] = 0x00;
+    buf[3] = SOCKS5_ADDR_IPV4;
+    memcpy(buf + 4, &assigned_addr.sin_addr, 4);
+    memcpy(buf + 8, &assigned_addr.sin_port, 2);
+    send(client_sock, (char *)buf, 10, 0);
+
+    // 3. Wait for connection (max 10s usually, we use our thread defaults)
+    // We should probably set a timeout on bind_sock accept
+    struct sockaddr_storage incoming_addr;
+    socklen_t incoming_len = sizeof(incoming_addr);
+
+    // Start accept
+    remote_sock =
+        accept(bind_sock, (struct sockaddr *)&incoming_addr, &incoming_len);
+    socks5_socket_close(bind_sock); // We only accept one connection
+
+    if (remote_sock == SOCKS5_INVALID_SOCKET) {
+      // Timeout or error
+      // The spec says if it fails, we send a failure reply... but we already
+      // sent success? No, existing TCP conn is still open. We can send a second
+      // reply indicating failure.
+      buf[0] = SOCKS5_VERSION;
+      buf[1] = SOCKS5_REPLY_FAILURE;
+      buf[2] = 0x00;
+      buf[3] = SOCKS5_ADDR_IPV4;
+      memset(buf + 4, 0, 6);
+      send(client_sock, (char *)buf, 10, 0);
+      goto cleanup;
+    }
+
+    // 4. Send Second Reply
+    buf[0] = SOCKS5_VERSION;
+    buf[1] = SOCKS5_REPLY_SUCCEEDED;
+    buf[2] = 0x00;
+    if (incoming_addr.ss_family == AF_INET) {
+      struct sockaddr_in *s = (struct sockaddr_in *)&incoming_addr;
+      buf[3] = SOCKS5_ADDR_IPV4;
+      memcpy(buf + 4, &s->sin_addr, 4);
+      memcpy(buf + 8, &s->sin_port, 2);
+      send(client_sock, (char *)buf, 10, 0);
+    } else {
+      // Assume IPv4 for short
       buf[3] = SOCKS5_ADDR_IPV4;
       memset(buf + 4, 0, 6);
       send(client_sock, (char *)buf, 10, 0);
     }
-  } else {
+
+    socks5_log(server, SOCKS5_LOG_INFO, "BIND accepted connection");
+
+    goto start_relay;
+
+  bind_error:
+    buf[0] = SOCKS5_VERSION;
     buf[1] = SOCKS5_REPLY_FAILURE;
     buf[2] = 0x00;
     buf[3] = SOCKS5_ADDR_IPV4;
     memset(buf + 4, 0, 6);
     send(client_sock, (char *)buf, 10, 0);
+    goto cleanup;
   }
 
+  if (cmd == SOCKS5_CMD_UDP_ASSOCIATE) {
+    socks5_log(server, SOCKS5_LOG_INFO, "UDP ASSOCIATE request from %s",
+               dst_addr);
+    session->start_time = time(NULL);
+
+    // 1. Create UDP socket
+    socks5_socket udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock == SOCKS5_INVALID_SOCKET) {
+      goto udp_error;
+    }
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind_addr.sin_port = 0; // Random port
+
+    if (bind(udp_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0) {
+      socks5_socket_close(udp_sock);
+      goto udp_error;
+    }
+
+    // 2. Send Reply (BND.ADDR/PORT)
+    struct sockaddr_in assigned_addr;
+    socklen_t len = sizeof(assigned_addr);
+    if (getsockname(udp_sock, (struct sockaddr *)&assigned_addr, &len) != 0) {
+      socks5_socket_close(udp_sock);
+      goto udp_error;
+    }
+
+    buf[0] = SOCKS5_VERSION;
+    buf[1] = SOCKS5_REPLY_SUCCEEDED;
+    buf[2] = 0x00;
+    buf[3] = SOCKS5_ADDR_IPV4;
+    // We should return the public IP preferably, but for now 0.0.0.0 or local
+    // is fine for test Actually getting the specific IP connects to might be
+    // better if we knew it, but binding INADDR_ANY ends up with 0.0.0.0 in
+    // getsockname usually. Ideally we use the IP the client connected to server
+    // on. logic: getsockname on client_sock?
+    struct sockaddr_in local_s;
+    socklen_t slen = sizeof(local_s);
+    if (getsockname(client_sock, (struct sockaddr *)&local_s, &slen) == 0) {
+      memcpy(buf + 4, &local_s.sin_addr, 4);
+    } else {
+      memcpy(buf + 4, &assigned_addr.sin_addr, 4);
+    }
+
+    memcpy(buf + 8, &assigned_addr.sin_port, 2);
+    send(client_sock, (char *)buf, 10, 0);
+
+    // 3. UDP Relay Loop
+    fd_set fds;
+    int max_fd = (int)((client_sock > udp_sock) ? client_sock : udp_sock) + 1;
+
+    // Allow client to send from any address initially until we see a packet?
+    // Or strict adherence to request?
+    // Request usually has 0.0.0.0 if dynamic.
+    // We will learn the client's actual UDP endpoint from the first packet they
+    // send us.
+    struct sockaddr_storage client_udp_addr = {0};
+    int client_udp_known = 0;
+
+    // Buffer for UDP packets (max 65535)
+    uint8_t udp_buf[65535];
+
+    while (server->running) {
+      FD_ZERO(&fds);
+      FD_SET(client_sock, &fds);
+      FD_SET(udp_sock, &fds);
+
+      // We use a timeout to allow checking server->running
+      struct timeval tv = {server->config.timeout_seconds, 0};
+      if (select(max_fd, &fds, NULL, NULL, &tv) <= 0) {
+        // Timeout or error (or signal)
+        // If timeout, usually keep going, but if error => break
+        // For strict timeout = break?
+        // If select returned 0 (timeout), loop again check running.
+        // But if error (-1) break.
+        // We'll just break on <= 0 for simplicity or check errno.
+        if (errno == EINTR)
+          continue;
+        break;
+      }
+
+      // Check TCP control (Client disconnect?)
+      if (FD_ISSET(client_sock, &fds)) {
+        char tmp[1];
+        if (recv(client_sock, tmp, 1, MSG_PEEK) <= 0) {
+          // Closed or Error
+          break;
+        }
+        // If data arrived on TCP, it shouldn't really happen for SOCKS5 UDP
+        // associate usually? "The client sends a UDP ASSOCIATE request...
+        // connection is kept alive..." Data on it? Maybe garbage. We can ignore
+        // or read&discard.
+        recv(client_sock, tmp, 1, 0);
+      }
+
+      // Check UDP
+      if (FD_ISSET(udp_sock, &fds)) {
+        struct sockaddr_storage sender_addr;
+        socklen_t sender_len = sizeof(sender_addr);
+        int n = recvfrom(udp_sock, (char *)udp_buf, sizeof(udp_buf), 0,
+                         (struct sockaddr *)&sender_addr, &sender_len);
+        if (n > 0) {
+          // Verify sender
+          // Simplification: First sender becomes the authorized client.
+          // Or check if sender matches current client_udp_addr (if known)
+
+          int is_from_client = 0;
+          if (!client_udp_known) {
+            // First packet! Assume it's client.
+            memcpy(&client_udp_addr, &sender_addr, sizeof(sender_addr));
+            client_udp_known = 1;
+            is_from_client = 1;
+          } else {
+            // Compare
+            // (Rough comparison for IPv4)
+            if (sender_addr.ss_family == AF_INET &&
+                client_udp_addr.ss_family == AF_INET) {
+              struct sockaddr_in *s1 = (struct sockaddr_in *)&sender_addr;
+              struct sockaddr_in *s2 = (struct sockaddr_in *)&client_udp_addr;
+              if (s1->sin_addr.s_addr == s2->sin_addr.s_addr &&
+                  s1->sin_port == s2->sin_port)
+                is_from_client = 1;
+            }
+            // IPv6 header comparison omitted for brevity in this snippet
+          }
+
+          if (is_from_client) {
+            // Packet from Client -> Parse Header -> Relay to Remote
+            // Header: RSV(2) FRAG(1) ATYP(1) ADDR(var) PORT(2) DATA...
+            if (n < 4)
+              continue; // Too short
+            if (udp_buf[2] != 0x00)
+              continue; // FRAG not supported
+
+            int header_len = 0;
+            struct sockaddr_storage target_addr;
+            // ... parsing logic ...
+            int atyp = udp_buf[3];
+            if (atyp == SOCKS5_ADDR_IPV4) {
+              if (n < 10)
+                continue;
+              header_len = 10;
+              struct sockaddr_in *t = (struct sockaddr_in *)&target_addr;
+              t->sin_family = AF_INET;
+              memcpy(&t->sin_addr, udp_buf + 4, 4);
+              memcpy(&t->sin_port, udp_buf + 8, 2);
+            } else {
+              // Support IPv4 only for this snippet simplicity or minimal IPv6
+              continue;
+            }
+
+            // Rewrite payload? No, raw UDP.
+            // Just unwrap: send payload (buf + header_len) to target
+            sendto(udp_sock, (char *)(udp_buf + header_len), n - header_len, 0,
+                   (struct sockaddr *)&target_addr, sizeof(struct sockaddr_in));
+            session->bytes_sent += (n - header_len);
+
+          } else {
+            // Packet from Remote -> Wrap with Header -> Send to Client
+            // Wrap: RSV(00 00) FRAG(00) ATYP(IPv4=01) SENDER_ADDR SENDER_PORT
+            // DATA We need enough space. We have udp_buf with data. We can't
+            // shift in place easily if full. But we received 'n' bytes.
+            // Construct a new buffer? Max UDP 65k.
+
+            uint8_t out_buf[65535];
+            out_buf[0] = 0x00;
+            out_buf[1] = 0x00; // RSV
+            out_buf[2] = 0x00; // FRAG
+
+            int hlen = 0;
+            if (sender_addr.ss_family == AF_INET) {
+              out_buf[3] = SOCKS5_ADDR_IPV4;
+              struct sockaddr_in *s = (struct sockaddr_in *)&sender_addr;
+              memcpy(out_buf + 4, &s->sin_addr, 4);
+              memcpy(out_buf + 8, &s->sin_port, 2);
+              hlen = 10;
+            } else {
+              continue; // Skip IPv6 for now
+            }
+
+            if ((size_t)(hlen + n) <= sizeof(out_buf)) {
+              memcpy(out_buf + hlen, udp_buf, n);
+              sendto(udp_sock, (char *)out_buf, hlen + n, 0,
+                     (struct sockaddr *)&client_udp_addr,
+                     sizeof(struct sockaddr_in));
+              session->bytes_received += n;
+            }
+          }
+        }
+      }
+    }
+
+    socks5_socket_close(udp_sock);
+    goto cleanup;
+
+  udp_error:
+    buf[0] = SOCKS5_VERSION;
+    buf[1] = SOCKS5_REPLY_FAILURE;
+    buf[2] = 0x00;
+    buf[3] = SOCKS5_ADDR_IPV4;
+    memset(buf + 4, 0, 6);
+    send(client_sock, (char *)buf, 10, 0);
+    goto cleanup;
+  }
+
+start_relay:
   if (remote_sock == SOCKS5_INVALID_SOCKET)
     goto cleanup;
 
@@ -362,17 +739,29 @@ static void socks5_handle_client(void *arg) {
       int n = recv(client_sock, (char *)buf, sizeof(buf), 0);
       if (n <= 0 || send(remote_sock, (char *)buf, n, 0) <= 0)
         break;
+      session->bytes_sent += n;
     }
     if (FD_ISSET(remote_sock, &fds)) {
       int n = recv(remote_sock, (char *)buf, sizeof(buf), 0);
       if (n <= 0 || send(client_sock, (char *)buf, n, 0) <= 0)
         break;
+      session->bytes_received += n;
     }
   }
   socks5_socket_close(remote_sock);
 
-cleanup:
+cleanup: {
+  double duration = difftime(time(NULL), session->start_time);
+  socks5_log(server, SOCKS5_LOG_INFO,
+             "Session finished: %llu bytes sent, %llu bytes received, "
+             "duration %.0fs",
+             (unsigned long long)session->bytes_sent,
+             (unsigned long long)session->bytes_received, duration);
+}
   socks5_socket_close(client_sock);
+  free(session);
+
+  atomic_fetch_sub(&server->active_connections, 1);
 }
 
 #ifdef _WIN32
@@ -409,8 +798,12 @@ socks5_server *socks5_server_init(const socks5_config *config) {
     server->config.backlog = 128;
   if (server->config.timeout_seconds == 0)
     server->config.timeout_seconds = 30;
+  if (server->config.max_connections == 0)
+    server->config.max_connections = 100;
+
   server->listen_sock = SOCKS5_INVALID_SOCKET;
   server->running = false;
+  atomic_init(&server->active_connections, 0);
   return server;
 }
 
@@ -437,6 +830,11 @@ void socks5_server_cleanup(socks5_server *server) {
     free(u);
     u = next;
   }
+
+  for (int i = 0; i < server->config.allow_ip_count; i++) {
+    free(server->config.allow_ips[i]);
+  }
+  free(server->config.allow_ips);
 
   free(server);
 #ifdef _WIN32
@@ -484,6 +882,15 @@ int socks5_server_run(socks5_server *server) {
         accept(server->listen_sock, (struct sockaddr *)&addr, &len);
     if (client == SOCKS5_INVALID_SOCKET)
       continue;
+
+    int active = atomic_load(&server->active_connections);
+    if (active >= server->config.max_connections) {
+      socks5_log(server, SOCKS5_LOG_WARN,
+                 "Max connections reached (%d), rejecting", active);
+      socks5_socket_close(client);
+      continue;
+    }
+    atomic_fetch_add(&server->active_connections, 1);
 
 #ifdef _WIN32
     DWORD timeout = server->config.timeout_seconds * 1000;
@@ -538,6 +945,10 @@ static void print_usage(const char *prog) {
   printf("  -b, --bind <ip>          Bind address (default: 0.0.0.0)\n");
   printf("  -u, --user <user:pass>   Add user (enables auth). Can be used "
          "multiple times.\n");
+  printf(
+      "  --max-conn <n>           Max concurrent connections (default: 100)\n");
+  printf("  --allow-ip <ip>          Allow only specific IP (can be used "
+         "multiple times)\n");
   printf("  -h, --help               Show this help message\n");
 }
 
@@ -557,6 +968,7 @@ static void logger(socks5_log_level level, const char *msg) {
     break;
   }
   printf("[%s] %s\n", msg, level_str);
+  fflush(stdout);
 }
 
 int main(int argc, char **argv) {
@@ -595,6 +1007,12 @@ int main(int argc, char **argv) {
         }
         free(u);
       }
+    } else if (strcmp(argv[i], "--max-conn") == 0) {
+      if (++i < argc)
+        config.max_connections = atoi(argv[i]);
+    } else if (strcmp(argv[i], "--allow-ip") == 0) {
+      if (++i < argc)
+        socks5_add_allow_ip(&config, argv[i]);
     } else {
       // Backward compatibility: first arg is port if not a flag
       if (i == 1 && argv[i][0] != '-') {

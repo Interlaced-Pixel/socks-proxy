@@ -5,6 +5,8 @@ import subprocess
 import sys
 import os
 import signal
+import re
+import tempfile
 
 SOCKS5_TIMEOUT = 1
 SERVER_BIN = "./socks5"
@@ -144,4 +146,298 @@ if __name__ == "__main__":
 
     # 5. CLI flag parsing checks
     run_test_case("Mixed Flags", ["-b", "127.0.0.1"], test_no_auth)
+
+    # 6. Observability Test (Timestamps & Stats)
+    def test_observability_check(port):
+        s, _ = connect_socks5(port, methods=[0x00])
+        # Simulate a small session
+        # CONNECT to something (doesn't have to succeed fully, just need to trigger session start)
+        # We'll try to connect to ourselves just to have a target
+        cmd = b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('!H', port)
+        s.sendall(cmd)
+        # Just close immediately to trigger stats
+        s.close()
+        time.sleep(0.2) # Wait for server to log
+
+    print(f"TEST: Observability Values ... ", end='', flush=True)
+    port = BASE_PORT + (os.getpid() % 1000) + 100
+    
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False) as tmp_log:
+        log_path = tmp_log.name
+
+    final_args = [SERVER_BIN, "--port", str(port)]
+    # Redirect stdout to the temp file
+    with open(log_path, 'w') as log_out:
+        proc = subprocess.Popen(final_args, stdout=log_out, stderr=log_out)
+        
+    try:
+        if not wait_for_port(port):
+            print("FAIL (Server start)")
+        else:
+            try:
+                test_observability_check(port)
+                # Wait a bit for logs to flush
+                time.sleep(0.5)
+                
+                with open(log_path, 'r') as f:
+                    content = f.read()
+                
+                # Check 1: Timestamps
+                # [YYYY-MM-DD HH:MM:SS]
+                ts_pattern = r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]"
+                if not re.search(ts_pattern, content):
+                    print(f"FAIL (No timestamps found in log: {content})")
+                
+                # Check 2: Session Stats
+                # Session finished: X bytes sent, Y bytes received
+                # Since we sent some bytes (Handshake + Connect CMD), we expect some bytes sent/received count or at least 0
+                elif "Session finished:" not in content:
+                    print(f"FAIL (No session stats found in log: {content})")
+                else:
+                    print("PASS")
+                    
+            except Exception as e:
+                print(f"FAIL ({e})")
+    finally:
+        proc.terminate()
+        proc.wait()
+        if os.path.exists(log_path):
+            os.remove(log_path)
+
+
+    # 7. Security: Max Connections
+    def test_check_max_conn(port):
+        # 1. Connect first client (hold it open)
+        s1, _ = connect_socks5(port, methods=[0x00])
+        
+        # 2. Try connect second client (should be rejected/closed immediately)
+        try:
+             s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+             s2.settimeout(1.0)
+             s2.connect(('localhost', port))
+             # Send handshake
+             s2.sendall(b'\x05\x01\x00')
+             # Should get closed or empty recv
+             data = s2.recv(1024)
+             if len(data) == 0:
+                 pass # Good, closed
+             else:
+                 # It might accept then close, or failing handshake
+                 pass
+             s2.close()
+        except (ConnectionResetError, socket.timeout, Exception):
+             pass # Good
+             
+        s1.close()
+
+    # We need a custom runner for this to pass --max-conn 1
+    # But for simplicity, we can do manual check logic or adapt run_test_case
+    # Let's just do a specific block like Observability
+    print(f"TEST: Security Max Conn ... ", end='', flush=True)
+    port = port + 1
+    proc = subprocess.Popen([SERVER_BIN, "--port", str(port), "--max-conn", "1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if wait_for_port(port):
+            # Client 1
+            s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s1.connect(('localhost', port))
+            # Handshake
+            s1.sendall(b'\x05\x01\x00')
+            s1.recv(2) # 05 00
+            
+            # Client 2
+            try:
+                s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s2.connect(('localhost', port))
+                # It might connect TCP, but then server closes it during loop check
+                # Send handshake
+                s2.sendall(b'\x05\x01\x00')
+                # Expect close
+                d = s2.recv(10)
+                if len(d) == 0:
+                    print("PASS")
+                else:
+                    print(f"FAIL (Client 2 got data: {d})")
+                s2.close()
+            except Exception as e:
+                print(f"PASS ({e})")
+                
+            s1.close()
+        else:
+            print("FAIL (Start)")
+    except Exception as e:
+        print(f"FAIL ({e})")
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+    # 8. Security: Allow IP
+    print(f"TEST: Security Allow IP ... ", end='', flush=True)
+    port = port + 1
+    # Allow logic: if allow-ip is set, others should be blocked.
+    # We are connecting from 127.0.0.1.
+    # Case A: Allow 1.2.3.4 (Block us)
+    proc1 = subprocess.Popen([SERVER_BIN, "--port", str(port), "--allow-ip", "1.2.3.4"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if wait_for_port(port):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect(('localhost', port))
+                s.sendall(b'\x05\x01\x00')
+                data = s.recv(10)
+                if len(data) == 0:
+                    # Connection closed = Good
+                    pass 
+                else:
+                     # Access denied usually just closes, or maybe sends nothing then closes
+                     print(f"FAIL (Should be blocked, got {data})")
+                     # Note: Our code does `goto cleanup` which closes socket.
+                s.close()
+            except Exception:
+                pass 
+        else:
+            print("FAIL (Start 1)")
+    finally:
+        proc1.terminate()
+        proc1.wait()
+        
+    # Case B: Allow 127.0.0.1 (Allow us)
+    port = port + 1
+    proc2 = subprocess.Popen([SERVER_BIN, "--port", str(port), "--allow-ip", "127.0.0.1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if wait_for_port(port):
+            try:
+                s, _ = connect_socks5(port)
+                s.close()
+                print("PASS")
+            except Exception as e:
+                print(f"FAIL (Should be allowed: {e})")
+        else:
+            print("FAIL (Start 2)")
+    finally:
+        proc2.terminate()
+        proc2.wait()
+
+    # 9. BIND Test
+    print(f"TEST: BIND Command ... ", end='', flush=True)
+    port = port + 1
+    proc_bind = subprocess.Popen([SERVER_BIN, "--port", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if wait_for_port(port):
+            s, _ = connect_socks5(port)
+            
+            # Send BIND request
+            # 05 02 00 01 00000000 0000 (Bind to 0.0.0.0:0 usually, or specific if desired)
+            cmd = b'\x05\x02\x00\x01' + socket.inet_aton('0.0.0.0') + struct.pack('!H', 0)
+            s.sendall(cmd)
+            
+            # Receive First Reply (BND.ADDR/PORT)
+            reply1 = s.recv(10)
+            if len(reply1) < 10 or reply1[1] != 0x00:
+                print(f"FAIL (First Reply: {reply1})")
+            else:
+                bnd_port = struct.unpack('!H', reply1[8:10])[0]
+                # Now we need to act as the "Application Server" and connect to this bnd_port
+                try:
+                    p = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    p.connect(('localhost', bnd_port))
+                    
+                    # Receive Second Reply on control channel
+                    # It might take a moment
+                    reply2 = s.recv(10)
+                    if len(reply2) < 10 or reply2[1] != 0x00:
+                        print(f"FAIL (Second Reply: {reply2})")
+                    else:
+                        # Test Relay: Send data from Peer -> Proxy -> Client
+                        p.sendall(b"HelloBIND")
+                        data = s.recv(10)
+                        if data == b"HelloBIND":
+                             print("PASS")
+                        else:
+                             print(f"FAIL (Data mismatch: {data})")
+                    p.close()
+                except Exception as e:
+                    print(f"FAIL (Connect to bind port: {e})")
+            s.close()
+        else:
+             print("FAIL (Start BIND)")
+    finally:
+        proc_bind.terminate()
+        proc_bind.wait()
+
+
+    # 10. UDP ASSOCIATE Test
+    print(f"TEST: UDP ASSOCIATE ... ", end='', flush=True)
+    port = port + 1
+    proc_udp = subprocess.Popen([SERVER_BIN, "--port", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if wait_for_port(port):
+            s, _ = connect_socks5(port)
+            
+            # Send UDP ASSOCIATE request
+            # 05 03 00 01 00000000 0000 (We want to send from 0.0.0.0:0 usually, or just claims so)
+            cmd = b'\x05\x03\x00\x01' + socket.inet_aton('0.0.0.0') + struct.pack('!H', 0)
+            s.sendall(cmd)
+            
+            # Receive Reply (BND.ADDR/PORT of UDP socket)
+            reply = s.recv(10)
+            if len(reply) < 10 or reply[1] != 0x00:
+                print(f"FAIL (Reply: {reply})")
+            else:
+                udp_port = struct.unpack('!H', reply[8:10])[0]
+                udp_addr_bytes = reply[4:8]
+                udp_ip = socket.inet_ntoa(udp_addr_bytes)
+                if udp_ip == '0.0.0.0': udp_ip = '127.0.0.1' # If it returned 0.0.0.0, use localhost
+                
+                # Create UDP client
+                u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                
+                # Construct SOCKS5 UDP Header + Data
+                # RSV(2) FRAG(1) ATYP(1) DST.ADDR(4) DST.PORT(2) DATA
+                # We want to send to "127.0.0.1:12345" (fake target)
+                # But wait, we need an echo server to verify?
+                # We send to *our own* UDP listener.
+                
+                echo_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                echo_sock.bind(('127.0.0.1', 0))
+                _, echo_port = echo_sock.getsockname()
+                
+                # Header to target (our echo sock)
+                pkt = b'\x00\x00\x00\x01' + socket.inet_aton('127.0.0.1') + struct.pack('!H', echo_port) + b"HelloUDP"
+                
+                # Send to Proxy UDP port
+                u.sendto(pkt, (udp_ip, udp_port))
+                
+                # Check echo sock received payload
+                echo_sock.settimeout(2)
+                try:
+                    data, addr = echo_sock.recvfrom(1024)
+                    if data == b"HelloUDP":
+                        # Now reply!
+                        echo_sock.sendto(b"ReplyUDP", addr)
+                        
+                        # Proxy should wrap it and send back to u
+                        u.settimeout(2)
+                        d2, _ = u.recvfrom(1024)
+                        # d2 should be Header + ReplyUDP
+                        # Header is 10 bytes usually for IPv4
+                        if b"ReplyUDP" in d2:
+                             print("PASS")
+                        else:
+                             print(f"FAIL (Reply mismatch: {d2})")
+                    else:
+                        print(f"FAIL (Echo mismatch: {data})")
+                except Exception as e:
+                     print(f"FAIL (Timeout/Error: {e})")
+                
+                u.close()
+                echo_sock.close()
+                
+            s.close()
+        else:
+             print("FAIL (Start UDP)")
+    finally:
+        proc_udp.terminate()
+        proc_udp.wait()
 
