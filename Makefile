@@ -8,7 +8,13 @@ CC := clang
 endif
 
 CFLAGS = -Wall -Wextra -O2 -I.
+
+# Detect Windows (MSYS2/MinGW) and link Winsock instead of pthreads
+ifeq ($(OS),Windows_NT)
+LDFLAGS = -lws2_32
+else
 LDFLAGS = -lpthread
+endif
 
 SRCS = socks5.c
 TARGET = socks5
