@@ -618,25 +618,28 @@ static void socks5_handle_client(void *arg) {
                dst_addr);
     session->start_time = time(NULL);
 
-    // 1. Create UDP socket
-    socks5_socket udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    // 1. Create UDP socket (dual-stack IPv6 socket accepting IPv4 too)
+    socks5_socket udp_sock = socket(AF_INET6, SOCK_DGRAM, 0);
     if (udp_sock == SOCKS5_INVALID_SOCKET) {
       goto udp_error;
     }
+    // Allow IPv4-mapped addresses on the IPv6 socket (dual-stack)
+    int v6only = 0;
+    setsockopt(udp_sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&v6only, sizeof(v6only));
 
-    struct sockaddr_in bind_addr;
-    memset(&bind_addr, 0, sizeof(bind_addr));
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind_addr.sin_port = 0; // Random port
+    struct sockaddr_in6 bind_addr6;
+    memset(&bind_addr6, 0, sizeof(bind_addr6));
+    bind_addr6.sin6_family = AF_INET6;
+    bind_addr6.sin6_addr = in6addr_any;
+    bind_addr6.sin6_port = 0; // Random port
 
-    if (bind(udp_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0) {
+    if (bind(udp_sock, (struct sockaddr *)&bind_addr6, sizeof(bind_addr6)) != 0) {
       socks5_socket_close(udp_sock);
       goto udp_error;
     }
 
-    // 2. Send Reply (BND.ADDR/PORT)
-    struct sockaddr_in assigned_addr;
+    // 2. Send Reply (BND.ADDR/PORT) - report the address the client can reach
+    struct sockaddr_storage assigned_addr;
     socklen_t len = sizeof(assigned_addr);
     if (getsockname(udp_sock, (struct sockaddr *)&assigned_addr, &len) != 0) {
       socks5_socket_close(udp_sock);
@@ -646,32 +649,39 @@ static void socks5_handle_client(void *arg) {
     buf[0] = SOCKS5_VERSION;
     buf[1] = SOCKS5_REPLY_SUCCEEDED;
     buf[2] = 0x00;
-    buf[3] = SOCKS5_ADDR_IPV4;
-    // We should return the public IP preferably, but for now 0.0.0.0 or local
-    // is fine for test Actually getting the specific IP connects to might be
-    // better if we knew it, but binding INADDR_ANY ends up with 0.0.0.0 in
-    // getsockname usually. Ideally we use the IP the client connected to server
-    // on. logic: getsockname on client_sock?
-    struct sockaddr_in local_s;
+
+    struct sockaddr_storage local_s;
     socklen_t slen = sizeof(local_s);
+    const struct sockaddr *report_addr = NULL;
     if (getsockname(client_sock, (struct sockaddr *)&local_s, &slen) == 0) {
-      memcpy(buf + 4, &local_s.sin_addr, 4);
+      report_addr = (const struct sockaddr *)&local_s;
     } else {
-      memcpy(buf + 4, &assigned_addr.sin_addr, 4);
+      report_addr = (const struct sockaddr *)&assigned_addr;
     }
 
-    memcpy(buf + 8, &assigned_addr.sin_port, 2);
-    send(client_sock, (char *)buf, 10, 0);
+    if (report_addr->sa_family == AF_INET) {
+      struct sockaddr_in *s = (struct sockaddr_in *)report_addr;
+      buf[3] = SOCKS5_ADDR_IPV4;
+      memcpy(buf + 4, &s->sin_addr, 4);
+      memcpy(buf + 8, &s->sin_port, 2);
+      send(client_sock, (char *)buf, 10, 0);
+    } else if (report_addr->sa_family == AF_INET6) {
+      struct sockaddr_in6 *s = (struct sockaddr_in6 *)report_addr;
+      buf[3] = SOCKS5_ADDR_IPV6;
+      memcpy(buf + 4, &s->sin6_addr, 16);
+      memcpy(buf + 20, &s->sin6_port, 2);
+      send(client_sock, (char *)buf, 22, 0);
+    } else {
+      buf[3] = SOCKS5_ADDR_IPV4;
+      memset(buf + 4, 0, 6);
+      send(client_sock, (char *)buf, 10, 0);
+    }
 
     // 3. UDP Relay Loop
     fd_set fds;
     int max_fd = (int)((client_sock > udp_sock) ? client_sock : udp_sock) + 1;
 
-    // Allow client to send from any address initially until we see a packet?
-    // Or strict adherence to request?
-    // Request usually has 0.0.0.0 if dynamic.
-    // We will learn the client's actual UDP endpoint from the first packet they
-    // send us.
+    // Allow client to send from any address initially until we see a packet
     struct sockaddr_storage client_udp_addr = {0};
     int client_udp_known = 0;
 
@@ -683,63 +693,48 @@ static void socks5_handle_client(void *arg) {
       FD_SET(client_sock, &fds);
       FD_SET(udp_sock, &fds);
 
-      // We use a timeout to allow checking server->running
       struct timeval tv = {server->config.timeout_seconds, 0};
       if (select(max_fd, &fds, NULL, NULL, &tv) <= 0) {
-        // Timeout or error (or signal)
-        // If timeout, usually keep going, but if error => break
-        // For strict timeout = break?
-        // If select returned 0 (timeout), loop again check running.
-        // But if error (-1) break.
-        // We'll just break on <= 0 for simplicity or check errno.
         if (errno == EINTR)
           continue;
         break;
       }
 
-      // Check TCP control (Client disconnect?)
       if (FD_ISSET(client_sock, &fds)) {
         char tmp[1];
         if (recv(client_sock, tmp, 1, MSG_PEEK) <= 0) {
-          // Closed or Error
           break;
         }
-        // If data arrived on TCP, it shouldn't really happen for SOCKS5 UDP
-        // associate usually? "The client sends a UDP ASSOCIATE request...
-        // connection is kept alive..." Data on it? Maybe garbage. We can ignore
-        // or read&discard.
         recv(client_sock, tmp, 1, 0);
       }
 
-      // Check UDP
       if (FD_ISSET(udp_sock, &fds)) {
         struct sockaddr_storage sender_addr;
         socklen_t sender_len = sizeof(sender_addr);
         int n = recvfrom(udp_sock, (char *)udp_buf, sizeof(udp_buf), 0,
                          (struct sockaddr *)&sender_addr, &sender_len);
         if (n > 0) {
-          // Verify sender
-          // Simplification: First sender becomes the authorized client.
-          // Or check if sender matches current client_udp_addr (if known)
-
           int is_from_client = 0;
           if (!client_udp_known) {
-            // First packet! Assume it's client.
             memcpy(&client_udp_addr, &sender_addr, sizeof(sender_addr));
             client_udp_known = 1;
             is_from_client = 1;
           } else {
-            // Compare
-            // (Rough comparison for IPv4)
-            if (sender_addr.ss_family == AF_INET &&
-                client_udp_addr.ss_family == AF_INET) {
-              struct sockaddr_in *s1 = (struct sockaddr_in *)&sender_addr;
-              struct sockaddr_in *s2 = (struct sockaddr_in *)&client_udp_addr;
-              if (s1->sin_addr.s_addr == s2->sin_addr.s_addr &&
-                  s1->sin_port == s2->sin_port)
-                is_from_client = 1;
+            if (sender_addr.ss_family == client_udp_addr.ss_family) {
+              if (sender_addr.ss_family == AF_INET) {
+                struct sockaddr_in *s1 = (struct sockaddr_in *)&sender_addr;
+                struct sockaddr_in *s2 = (struct sockaddr_in *)&client_udp_addr;
+                if (s1->sin_addr.s_addr == s2->sin_addr.s_addr &&
+                    s1->sin_port == s2->sin_port)
+                  is_from_client = 1;
+              } else if (sender_addr.ss_family == AF_INET6) {
+                struct sockaddr_in6 *s1 = (struct sockaddr_in6 *)&sender_addr;
+                struct sockaddr_in6 *s2 = (struct sockaddr_in6 *)&client_udp_addr;
+                if (memcmp(&s1->sin6_addr, &s2->sin6_addr, sizeof(struct in6_addr)) == 0 &&
+                    s1->sin6_port == s2->sin6_port)
+                  is_from_client = 1;
+              }
             }
-            // IPv6 header comparison omitted for brevity in this snippet
           }
 
           if (is_from_client) {
@@ -752,7 +747,7 @@ static void socks5_handle_client(void *arg) {
 
             int header_len = 0;
             struct sockaddr_storage target_addr;
-            // ... parsing logic ...
+            socklen_t target_len = 0;
             int atyp = udp_buf[3];
             if (atyp == SOCKS5_ADDR_IPV4) {
               if (n < 10)
@@ -762,24 +757,55 @@ static void socks5_handle_client(void *arg) {
               t->sin_family = AF_INET;
               memcpy(&t->sin_addr, udp_buf + 4, 4);
               memcpy(&t->sin_port, udp_buf + 8, 2);
+              target_len = sizeof(struct sockaddr_in);
+            } else if (atyp == SOCKS5_ADDR_IPV6) {
+              if (n < 22)
+                continue;
+              header_len = 22;
+              struct sockaddr_in6 *t = (struct sockaddr_in6 *)&target_addr;
+              t->sin6_family = AF_INET6;
+              memcpy(&t->sin6_addr, udp_buf + 4, 16);
+              memcpy(&t->sin6_port, udp_buf + 20, 2);
+              target_len = sizeof(struct sockaddr_in6);
+            } else if (atyp == SOCKS5_ADDR_DOMAINNAME) {
+              if (n < 5)
+                continue;
+              uint8_t dlen = udp_buf[4];
+              if (n < 4 + 1 + dlen + 2)
+                continue;
+              if (dlen >= 255)
+                continue;
+              char host[256];
+              memcpy(host, udp_buf + 5, dlen);
+              host[dlen] = '\0';
+              uint16_t port = ntohs(*(uint16_t *)(udp_buf + 5 + dlen));
+              char port_str[8];
+              snprintf(port_str, sizeof(port_str), "%u", port);
+              struct addrinfo hints, *res = NULL;
+              memset(&hints, 0, sizeof(hints));
+              hints.ai_socktype = SOCK_DGRAM;
+              hints.ai_family = AF_UNSPEC;
+              if (getaddrinfo(host, port_str, &hints, &res) != 0)
+                continue;
+              // Use first resolved entry
+              if (res->ai_addrlen <= sizeof(target_addr)) {
+                memcpy(&target_addr, res->ai_addr, res->ai_addrlen);
+                target_len = (socklen_t)res->ai_addrlen;
+              }
+              freeaddrinfo(res);
+              header_len = 4 + 1 + dlen + 2;
             } else {
-              // Support IPv4 only for this snippet simplicity or minimal IPv6
               continue;
             }
 
-            // Rewrite payload? No, raw UDP.
-            // Just unwrap: send payload (buf + header_len) to target
-            sendto(udp_sock, (char *)(udp_buf + header_len), n - header_len, 0,
-                   (struct sockaddr *)&target_addr, sizeof(struct sockaddr_in));
-            session->bytes_sent += (n - header_len);
+            // Send payload to target
+            ssize_t s = sendto(udp_sock, (char *)(udp_buf + header_len), n - header_len, 0,
+                               (struct sockaddr *)&target_addr, target_len);
+            if (s > 0)
+              session->bytes_sent += (n - header_len);
 
           } else {
             // Packet from Remote -> Wrap with Header -> Send to Client
-            // Wrap: RSV(00 00) FRAG(00) ATYP(IPv4=01) SENDER_ADDR SENDER_PORT
-            // DATA We need enough space. We have udp_buf with data. We can't
-            // shift in place easily if full. But we received 'n' bytes.
-            // Construct a new buffer? Max UDP 65k.
-
             uint8_t out_buf[65535];
             out_buf[0] = 0x00;
             out_buf[1] = 0x00; // RSV
@@ -792,15 +818,21 @@ static void socks5_handle_client(void *arg) {
               memcpy(out_buf + 4, &s->sin_addr, 4);
               memcpy(out_buf + 8, &s->sin_port, 2);
               hlen = 10;
+            } else if (sender_addr.ss_family == AF_INET6) {
+              out_buf[3] = SOCKS5_ADDR_IPV6;
+              struct sockaddr_in6 *s = (struct sockaddr_in6 *)&sender_addr;
+              memcpy(out_buf + 4, &s->sin6_addr, 16);
+              memcpy(out_buf + 20, &s->sin6_port, 2);
+              hlen = 22;
             } else {
-              continue; // Skip IPv6 for now
+              continue;
             }
 
             if ((size_t)(hlen + n) <= sizeof(out_buf)) {
               memcpy(out_buf + hlen, udp_buf, n);
+              socklen_t client_len = (client_udp_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
               sendto(udp_sock, (char *)out_buf, hlen + n, 0,
-                     (struct sockaddr *)&client_udp_addr,
-                     sizeof(struct sockaddr_in));
+                     (struct sockaddr *)&client_udp_addr, client_len);
               session->bytes_received += n;
             }
           }
@@ -1065,7 +1097,7 @@ static const char *socks5_service_unit =
 "# Change User to a dedicated user if possible, e.g., 'socks5'\n"
 "User=nobody\n"
 "# Adjust path to where you install the binary\n"
-"ExecStart=/usr/local/bin/socks5 --port 1080 --max-conn 500\n"
+"ExecStart=/usr/local/bin/socks5 -u user:pass --port 1080 --max-conn 5000\n"
 "# Restart automatically if it crashes\n"
 "Restart=on-failure\n"
 "RestartSec=5s\n"
