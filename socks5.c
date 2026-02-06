@@ -30,8 +30,8 @@
 // Program version (semantic versioning)
 #define SOCKS5_VERSION_MAJOR 0
 #define SOCKS5_VERSION_MINOR 1
-#define SOCKS5_VERSION_PATCH 1
-#define SOCKS5_VERSION_STR "0.1.1"
+#define SOCKS5_VERSION_PATCH 2
+#define SOCKS5_VERSION_STR "0.1.2"
 
 // Authentication methods
 #define SOCKS5_AUTH_NONE 0x00
@@ -1231,7 +1231,7 @@ static void logger(socks5_log_level level, const char *msg) {
   default:
     break;
   }
-  printf("[%s] %s\n", msg, level_str);
+  printf("%s [%s]\n", msg, level_str);
   fflush(stdout);
 }
 
