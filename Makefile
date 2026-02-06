@@ -10,7 +10,16 @@ all: $(TARGET)
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET) $(LDFLAGS)
 
-clean:
-	rm -f $(TARGET)
+TESTS = tests
+TEST_SRCS = tests.c
 
-.PHONY: all clean
+tests: $(TEST_SRCS)
+	$(CC) $(CFLAGS) $(TEST_SRCS) -o $(TESTS) $(LDFLAGS)
+
+check: all tests
+	./$(TESTS)
+
+clean:
+	rm -f $(TARGET) $(TESTS)
+
+.PHONY: all clean tests check
