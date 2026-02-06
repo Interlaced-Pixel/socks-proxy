@@ -15,6 +15,12 @@
 
 #include <stdatomic.h>
 
+#include <libgen.h>
+#include <limits.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+
 /* --- Constants & Protocol Definitions --- */
 
 #define SOCKS5_VERSION 0x05
@@ -206,6 +212,101 @@ static void socks5_socket_close(socks5_socket s) {
 #else
   close(s);
 #endif
+}
+
+// Write a file by memory-mapping the source binary and writing its bytes to dst.
+// This avoids relying on a separate on-disk source during install.
+static int write_file_from_memory(const char *src, const char *dst, mode_t mode) {
+  int in_fd = open(src, O_RDONLY);
+  if (in_fd < 0)
+    return -1;
+  struct stat st;
+  if (fstat(in_fd, &st) != 0) {
+    close(in_fd);
+    return -1;
+  }
+  off_t size = st.st_size;
+  if (size <= 0) {
+    close(in_fd);
+    return -1;
+  }
+
+  void *map = mmap(NULL, (size_t)size, PROT_READ, MAP_PRIVATE, in_fd, 0);
+  if (map == MAP_FAILED) {
+    close(in_fd);
+    return -1;
+  }
+
+  int out_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
+  if (out_fd < 0) {
+    munmap(map, (size_t)size);
+    close(in_fd);
+    return -1;
+  }
+
+  ssize_t written = write(out_fd, map, (size_t)size);
+  if (written != (ssize_t)size) {
+    munmap(map, (size_t)size);
+    close(in_fd);
+    close(out_fd);
+    return -1;
+  }
+
+  if (fsync(out_fd) != 0) {
+    // ignore fsync failure
+  }
+  if (close(out_fd) != 0) {
+    munmap(map, (size_t)size);
+    close(in_fd);
+    return -1;
+  }
+
+  munmap(map, (size_t)size);
+
+  if (chmod(dst, mode) != 0) {
+    close(in_fd);
+    return -1;
+  }
+
+  close(in_fd);
+  return 0;
+}
+
+// Write a raw buffer to a file (used for embedded unit file)
+static int write_buffer_to_file(const char *buf, size_t len, const char *dst, mode_t mode) {
+  int out_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
+  if (out_fd < 0)
+    return -1;
+  ssize_t written = write(out_fd, buf, len);
+  if (written != (ssize_t)len) {
+    close(out_fd);
+    return -1;
+  }
+  if (fsync(out_fd) != 0) { /* ignore */ }
+  if (close(out_fd) != 0)
+    return -1;
+  if (chmod(dst, mode) != 0)
+    return -1;
+  return 0;
+}
+
+// Simple Y/N confirmation prompt. Returns 1 for yes, 0 for no.
+static int confirm_prompt(const char *msg) {
+  char buf[16];
+  printf("%s [y/N]: ", msg);
+  fflush(stdout);
+  if (!fgets(buf, sizeof(buf), stdin))
+    return 0;
+  // Strip newline
+  for (char *p = buf; *p; ++p) {
+    if (*p == '\n' || *p == '\r') {
+      *p = '\0';
+      break;
+    }
+  }
+  if (buf[0] == 'y' || buf[0] == 'Y')
+    return 1;
+  return 0;
 }
 
 typedef struct {
@@ -942,15 +1043,44 @@ static void print_usage(const char *prog) {
   printf("Usage: %s [options] [port]\n", prog);
   printf("Options:\n");
   printf("  -p, --port <port>        Port to listen on (default: 1080)\n");
+  printf("  -p, --port <port>        Port to listen on (default: 1080)\n");
   printf("  -b, --bind <ip>          Bind address (default: 0.0.0.0)\n");
   printf("  -u, --user <user:pass>   Add user (enables auth). Can be used "
          "multiple times.\n");
   printf(
-      "  --max-conn <n>           Max concurrent connections (default: 100)\n");
-  printf("  --allow-ip <ip>          Allow only specific IP (can be used "
-         "multiple times)\n");
+      "  --max-conn <n>              Max concurrent connections (default: 100)\n");
+  printf("  --allow-ip <ip>          Allow only specific IP (can be used multiple times)\n");
+  printf("  --install <mode>         Install the service (mode: systemd/service)\n");
+  printf("  --uninstall <mode>       Uninstall the service (mode: systemd/service)\n");
   printf("  -h, --help               Show this help message\n");
 }
+
+static const char *socks5_service_unit =
+"[Unit]\n"
+"Description=Interlaced Pixel SOCKS5 Proxy Server\n"
+"After=network.target\n"
+"\n"
+"[Service]\n"
+"Type=simple\n"
+"# Change User to a dedicated user if possible, e.g., 'socks5'\n"
+"User=nobody\n"
+"# Adjust path to where you install the binary\n"
+"ExecStart=/usr/local/bin/socks5 --port 1080 --max-conn 500\n"
+"# Restart automatically if it crashes\n"
+"Restart=on-failure\n"
+"RestartSec=5s\n"
+"\n"
+"# Security hardening (optional but recommended for systemd)\n"
+"CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n"
+"AmbientCapabilities=CAP_NET_BIND_SERVICE\n"
+"NoNewPrivileges=true\n"
+"PrivateTmp=true\n"
+"ProtectSystem=full\n"
+"ProtectHome=true\n"
+"\n"
+"[Install]\n"
+"WantedBy=multi-user.target\n"
+"";
 
 static void logger(socks5_log_level level, const char *msg) {
   const char *level_str = "INFO";
@@ -984,6 +1114,173 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       print_usage(argv[0]);
       return 0;
+    } else if (strcmp(argv[i], "--install") == 0) {
+      if (++i < argc) {
+#ifdef _WIN32
+        fprintf(stderr, "--install is not supported on Windows in this build\n");
+#else
+        const char *arg = argv[i];
+        char src_real[PATH_MAX] = {0};
+        if (!realpath(argv[0], src_real)) {
+          // fall back to argv[0] directly
+          strncpy(src_real, argv[0], sizeof(src_real) - 1);
+        }
+
+        // If user asked for "systemd" or "service", install binary to /usr/local/bin
+        // and attempt to install the included socks5.service to systemd.
+        if (strcmp(arg, "systemd") == 0 || strcmp(arg, "service") == 0) {
+          if (geteuid() != 0) {
+            fprintf(stderr, "Installing systemd service requires root privileges. Run with sudo.\n");
+            return 1;
+          }
+          const char *dest_dir = "/usr/local/bin";
+          const char *basename_prog = basename((char *)argv[0]);
+          char dest_path[PATH_MAX];
+          snprintf(dest_path, sizeof(dest_path), "%s/%s", dest_dir, basename_prog);
+
+          if (write_file_from_memory(src_real, dest_path, 0755) != 0) {
+            fprintf(stderr, "Failed to write binary to %s: %s\n", dest_path, strerror(errno));
+            return 1;
+          }
+          printf("Installed %s -> %s\n", src_real, dest_path);
+
+          // Install systemd unit if available
+          const char *svc_dst = "/etc/systemd/system/socks5.service";
+            if (write_buffer_to_file(socks5_service_unit, (size_t)strlen(socks5_service_unit), svc_dst, 0644) != 0) {
+              fprintf(stderr, "Failed to write service file to %s: %s\n", svc_dst, strerror(errno));
+              return 1;
+            }
+            printf("Installed systemd unit -> %s\n", svc_dst);
+            // Try to enable and start
+            int r = system("systemctl daemon-reload && systemctl enable --now socks5.service");
+            if (r != 0) {
+              fprintf(stderr, "Warning: systemctl failed (exit %d). You may need to enable/start the service manually.\n", r);
+            } else {
+              printf("socks5.service enabled and started\n");
+            }
+          return 0;
+        }
+
+        // Otherwise treat arg as destination (dir or file)
+        char dest[PATH_MAX] = {0};
+        struct stat st2;
+        if (stat(arg, &st2) == 0 && S_ISDIR(st2.st_mode)) {
+          const char *basename_prog = basename((char *)argv[0]);
+          snprintf(dest, sizeof(dest), "%s/%s", arg, basename_prog);
+        } else {
+          // If arg looks like a directory path with trailing slash, treat as dir
+          size_t al = strlen(arg);
+          if (arg[al - 1] == '/') {
+            const char *basename_prog = basename((char *)argv[0]);
+            snprintf(dest, sizeof(dest), "%s%s", arg, basename_prog);
+          } else {
+            strncpy(dest, arg, sizeof(dest) - 1);
+          }
+        }
+
+        if (write_file_from_memory(src_real, dest, 0755) != 0) {
+          fprintf(stderr, "Failed to write binary to %s: %s\n", dest, strerror(errno));
+          return 1;
+        }
+        printf("Installed %s -> %s\n", src_real, dest);
+        return 0;
+#endif
+      }
+    } else if (strcmp(argv[i], "--uninstall") == 0) {
+      if (++i < argc){
+#ifdef _WIN32
+        fprintf(stderr, "--uninstall is not supported on Windows in this build\n");
+#else
+        const char *arg = argv[i];
+        char src_real[PATH_MAX] = {0};
+        if (!realpath(argv[0], src_real)) {
+          strncpy(src_real, argv[0], sizeof(src_real) - 1);
+        }
+
+        if (strcmp(arg, "systemd") == 0 || strcmp(arg, "service") == 0) {
+          if (geteuid() != 0) {
+            fprintf(stderr, "Uninstalling systemd service requires root privileges. Run with sudo.\n");
+            return 1;
+          }
+
+          if (!confirm_prompt("Uninstall will remove the systemd unit and the installed binary. Continue?")) {
+            printf("Aborted by user.\n");
+            return 1;
+          }
+
+          const char *svc_dst = "/etc/systemd/system/socks5.service";
+          if (access(svc_dst, F_OK) == 0) {
+            if (unlink(svc_dst) == 0) {
+              printf("Removed systemd unit: %s\n", svc_dst);
+            } else {
+              fprintf(stderr, "Failed to remove %s: %s\n", svc_dst, strerror(errno));
+            }
+          } else {
+            printf("Systemd unit %s not present; skipping.\n", svc_dst);
+          }
+
+          // Try to stop and disable the service
+          int r = system("systemctl stop socks5.service 2>/dev/null || true; systemctl disable socks5.service 2>/dev/null || true; systemctl daemon-reload 2>/dev/null || true");
+          if (r != 0) {
+            fprintf(stderr, "Warning: systemctl returned non-zero (exit %d); you may need to stop/disable the service manually.\n", r);
+          } else {
+            printf("Stopped and disabled socks5.service (if it was running).\n");
+          }
+
+          // Remove binary from /usr/local/bin
+          const char *dest_dir = "/usr/local/bin";
+          const char *basename_prog = basename((char *)argv[0]);
+          char installed_path[PATH_MAX];
+          snprintf(installed_path, sizeof(installed_path), "%s/%s", dest_dir, basename_prog);
+          if (access(installed_path, F_OK) == 0) {
+            if (unlink(installed_path) == 0) {
+              printf("Removed installed binary: %s\n", installed_path);
+            } else {
+              fprintf(stderr, "Failed to remove %s: %s\n", installed_path, strerror(errno));
+            }
+          } else {
+            printf("Installed binary %s not present; skipping.\n", installed_path);
+          }
+
+          return 0;
+        }
+
+        // Otherwise treat arg as destination (dir or file)
+        char dest[PATH_MAX] = {0};
+        struct stat st2;
+        if (stat(arg, &st2) == 0 && S_ISDIR(st2.st_mode)) {
+          const char *basename_prog = basename((char *)argv[0]);
+          snprintf(dest, sizeof(dest), "%s/%s", arg, basename_prog);
+        } else {
+          size_t al = strlen(arg);
+          if (al > 0 && arg[al - 1] == '/') {
+            const char *basename_prog = basename((char *)argv[0]);
+            snprintf(dest, sizeof(dest), "%s%s", arg, basename_prog);
+          } else {
+            strncpy(dest, arg, sizeof(dest) - 1);
+          }
+        }
+
+        if (access(dest, F_OK) != 0) {
+          fprintf(stderr, "File %s does not exist.\n", dest);
+          return 1;
+        }
+
+        char _msg[PATH_MAX + 64];
+        snprintf(_msg, sizeof(_msg), "Are you sure you want to remove %s?", dest);
+        if (!confirm_prompt(_msg)) {
+          printf("Aborted by user.\n");
+          return 1;
+        }
+
+        if (unlink(dest) != 0) {
+          fprintf(stderr, "Failed to remove %s: %s\n", dest, strerror(errno));
+          return 1;
+        }
+        printf("Removed %s\n", dest);
+        return 0;
+#endif
+      }
     } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) {
       if (++i < argc)
         config.port = (uint16_t)atoi(argv[i]);
