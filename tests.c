@@ -319,6 +319,23 @@ static int test_allow_ip(void) {
     return 0;
 }
 
+static int test_version_flag(void) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "%s --version", SERVER_BIN);
+    FILE *f = popen(cmd, "r");
+    if (!f) return 1;
+    char buf[128] = {0};
+    size_t n = fread(buf, 1, sizeof(buf)-1, f);
+    buf[n] = '\0';
+    int rc = pclose(f);
+#ifdef WIFEXITED
+    if (WIFEXITED(rc)) rc = WEXITSTATUS(rc);
+#endif
+    if (rc != 0) return 1;
+    if (strstr(buf, "0.1.0") == NULL) return 1;
+    return 0;
+}
+
 static int test_bind(void) {
     char *args[] = {SERVER_BIN, "--port", "1120", NULL};
     pid_t p = start_server((char *const *)args, NULL);
@@ -403,6 +420,7 @@ int main(void) {
         {"Auth Success", (int(*)(void))test_auth_success},
         {"Auth Fail", (int(*)(void))test_auth_failure},
         {"Auth Enforced", (int(*)(void))test_auth_required_header_check},
+        {"Version Flag", (int(*)(void))test_version_flag},
         {"Mixed Flags (NoAuth)", (int(*)(void))test_no_auth},
         {"Observability Values", (int(*)(void))test_observability},
         {"Security Max Conn", (int(*)(void))test_max_conn},

@@ -28,6 +28,7 @@ make
 | `--install <mode>` | Install as a service (`systemd`) or to a path |
 | `--uninstall <mode>` | Uninstall service (`systemd`) or from a path |
 | `-h, --help` | Show help |
+| `-V, --version` | Show program version |
 
 ### Examples
 

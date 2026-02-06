@@ -25,6 +25,12 @@
 
 #define SOCKS5_VERSION 0x05
 
+// Program version (semantic versioning)
+#define SOCKS5_VERSION_MAJOR 0
+#define SOCKS5_VERSION_MINOR 1
+#define SOCKS5_VERSION_PATCH 0
+#define SOCKS5_VERSION_STR "0.1.0"
+
 // Authentication methods
 #define SOCKS5_AUTH_NONE 0x00
 #define SOCKS5_AUTH_GSSAPI 0x01
@@ -1072,7 +1078,6 @@ static void print_usage(const char *prog) {
   printf("Usage: %s [options] [port]\n", prog);
   printf("Options:\n");
   printf("  -p, --port <port>        Port to listen on (default: 1080)\n");
-  printf("  -p, --port <port>        Port to listen on (default: 1080)\n");
   printf("  -b, --bind <ip>          Bind address (default: 0.0.0.0)\n");
   printf("  -u, --user <user:pass>   Add user (enables auth). Can be used "
          "multiple times.\n");
@@ -1082,7 +1087,9 @@ static void print_usage(const char *prog) {
   printf("  --install <mode>         Install the service (mode: systemd/service)\n");
   printf("  --uninstall <mode>       Uninstall the service (mode: systemd/service)\n");
   printf("  -h, --help               Show this help message\n");
+  printf("  -V, --version            Show program version\n");
 }
+
 
 static const char *socks5_service_unit =
 "[Unit]\n"
@@ -1142,6 +1149,9 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       print_usage(argv[0]);
+      return 0;
+    } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
+      printf("%s %s\n", argv[0], SOCKS5_VERSION_STR);
       return 0;
     } else if (strcmp(argv[i], "--install") == 0) {
       if (++i < argc) {
