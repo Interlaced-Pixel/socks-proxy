@@ -1,111 +1,93 @@
 # socks-proxy
 
-A lightweight, standalone, cross-platform SOCKS5 proxy server implemented in a single C file.
+A lightweight, single-file SOCKS5 proxy server written in C. Supports CONNECT, BIND, and UDP ASSOCIATE commands with optional username/password authentication and basic security features.
 
-## Overview
+## Building
 
-This project provides a single-file implementation of the SOCKS5 protocol (RFC 1928). It is designed to be easily embeddable or usable as a standalone proxy utility. The server supports `CONNECT`, `BIND`, and `UDP ASSOCIATE` commands with optional username/password authentication.
+Requires a C11-compatible compiler (clang or gcc) and pthreads.
 
-## Features
-
-- **Protocol Support**: SOCKS5 (RFC 1928).
-- **Authentication**:
-  - `NO AUTHENTICATION REQUIRED`
-  - `USERNAME/PASSWORD` (RFC 1929)
-- **Commands**: `CONNECT`, `BIND`, and `UDP ASSOCIATE`.
-- **Addressing**: IPv4, IPv6, and Domain Names.
-- **Cross-Platform**: Compiles and runs on macOS, Linux, and Windows (MinGW/MSVC).
-- **Concurrency**: Threaded handling for each client connection.
-- **Security**: IP allowlisting, configurable max connections.
-- **Self-Installing**: The binary can install itself (and an embedded systemd unit)
-
-## Building and Running
-
-### Prerequisites
-- GCC or Clang
-- Make (optional, but recommended)
-
-### Build
-```bash
+```sh
 make
-```
-
-### Run
-Start the server on the default port (1080):
-```bash
-./socks5
-```
-
-Specify a custom port:
-```bash
-./socks5 --port 8888
-# or shorthand:
-./socks5 8888
 ```
 
 ## Usage
 
+```sh
+./socks5 [options] [port]
 ```
-Usage: ./socks5 [options] [port]
 
-Options:
-  -p, --port <port>        Port to listen on (default: 1080)
-  -b, --bind <ip>          Bind address (default: 0.0.0.0)
-  -u, --user <user:pass>   Add user (enables auth). Can be used multiple times.
-  --max-conn <n>           Max concurrent connections (default: 100)
-  --allow-ip <ip>          Allow only specific IP (can be used multiple times)
-  --install <mode>         Install the service (mode: systemd/service, or a path)
-  --uninstall <mode>       Uninstall the service (mode: systemd/service, or a path)
-  -h, --help               Show help message
-```
+### Options
+
+| Flag | Description |
+|---|---|
+| `-p, --port <port>` | Port to listen on (default: 1080) |
+| `-b, --bind <ip>` | Bind address (default: 0.0.0.0) |
+| `-u, --user <user:pass>` | Add user credentials (enables auth). Repeatable. |
+| `--max-conn <n>` | Max concurrent connections (default: 100) |
+| `--allow-ip <ip>` | Restrict access to specific client IPs. Repeatable. |
+| `--install <mode>` | Install as a service (`systemd`) or to a path |
+| `--uninstall <mode>` | Uninstall service (`systemd`) or from a path |
+| `-h, --help` | Show help |
 
 ### Examples
 
-Listen on port 9090 with authentication:
-```bash
-./socks5 --port 9090 --user alice:secret --user bob:hunter2
+```sh
+# Start on default port (1080), no authentication
+./socks5
+
+# Start on port 8080 with authentication
+./socks5 -p 8080 -u admin:secret
+
+# Multiple users, restricted to specific client IPs
+./socks5 -u alice:pass1 -u bob:pass2 --allow-ip 192.168.1.10 --allow-ip 10.0.0.5
+
+# Limit concurrent connections
+./socks5 --max-conn 500
 ```
 
-Restrict to specific client IPs:
-```bash
-./socks5 --allow-ip 192.168.1.10 --allow-ip 10.0.0.5
+### Using with curl
+
+```sh
+curl --socks5-hostname localhost:1080 http://example.com
 ```
 
-## Installation
+### Installing as a systemd service (Linux)
 
-The binary installs itself from memory — no separate files need to exist on disk.
-
-### systemd (Linux)
-
-Install the binary to `/usr/local/bin` and write the embedded systemd unit to `/etc/systemd/system/socks5.service`:
-```bash
+```sh
 sudo ./socks5 --install systemd
 ```
 
-This will also run `systemctl daemon-reload` and enable/start the service.
+Edit `/etc/systemd/system/socks5.service` to adjust `ExecStart` arguments (port, users, etc.), then:
 
-### Custom path
-
-Install the binary to any directory or file path:
-```bash
-./socks5 --install /opt/bin/
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart socks5
 ```
 
-### Uninstall
+To uninstall:
 
-Remove the systemd service and installed binary:
-```bash
+```sh
 sudo ./socks5 --uninstall systemd
 ```
 
-Or remove from a custom path:
-```bash
-./socks5 --uninstall /opt/bin/socks5
+## Features
+
+- **SOCKS5 protocol** — CONNECT, BIND, and UDP ASSOCIATE commands
+- **Authentication** — No-auth and username/password (RFC 1929)
+- **IPv4 & IPv6** — Full dual-stack support
+- **IP allowlisting** — Restrict which client IPs may connect
+- **Connection limits** — Cap concurrent connections
+- **Session logging** — Timestamped logs with per-session byte/duration stats
+- **Cross-platform** — Builds on Linux, macOS, and Windows
+
+## Testing
+
+Tests require Python 3 and a compiled `socks5` binary in the project root.
+
+```sh
+make && python3 tests.py
 ```
 
-## Known Limitations
+## License
 
-- **IPv6**: Parsing and connecting over IPv6 works, but some reply paths fall back to an IPv4 placeholder address.
-- **Authentication**: GSSAPI is not supported.
-- **UDP ASSOCIATE**: Supports IPv4, IPv6, and domain-name targets (domain names are resolved at relay time).
-- **Install**: The `--install` and `--uninstall` options are not supported on Windows.
+[PolyForm Noncommercial 1.0.0](LICENSE) — free for non-commercial use. Contact the author for commercial licensing.
