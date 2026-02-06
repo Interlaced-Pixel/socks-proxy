@@ -67,6 +67,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <process.h>
+#include <io.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -222,6 +223,15 @@ static void socks5_socket_close(socks5_socket s) {
 #endif
 }
 
+// Portable fsync wrapper: use _commit on Windows, fsync on POSIX
+static int portable_fsync(int fd) {
+#ifdef _WIN32
+  return _commit(fd);
+#else
+  return fsync(fd);
+#endif
+}
+
 // Write a file by memory-mapping the source binary and writing its bytes to dst.
 // This avoids relying on a separate on-disk source during install.
 static int write_file_from_memory(const char *src, const char *dst, mode_t mode) {
@@ -261,7 +271,7 @@ static int write_file_from_memory(const char *src, const char *dst, mode_t mode)
     return -1;
   }
 
-  if (fsync(out_fd) != 0) {
+  if (portable_fsync(out_fd) != 0) {
     // ignore fsync failure
   }
   if (close(out_fd) != 0) {
@@ -323,7 +333,7 @@ static int write_buffer_to_file(const char *buf, size_t len, const char *dst, mo
     close(out_fd);
     return -1;
   }
-  if (fsync(out_fd) != 0) { /* ignore */ }
+  if (portable_fsync(out_fd) != 0) { /* ignore */ }
   if (close(out_fd) != 0)
     return -1;
   if (chmod(dst, mode) != 0)
@@ -705,7 +715,7 @@ static void socks5_handle_client(void *arg) {
       // Convert to an IPv4 reply (127.0.0.1) with the assigned port for
       // compatibility. The tests only use the port value.
       buf[3] = SOCKS5_ADDR_IPV4;
-      struct in_addr loopback = { htonl(INADDR_LOOPBACK) };
+      struct in_addr loopback = { .s_addr = htonl(INADDR_LOOPBACK) };
       memcpy(buf + 4, &loopback, 4);
       memcpy(buf + 8, &s6->sin6_port, 2);
       send(client_sock, (char *)buf, 10, 0);
