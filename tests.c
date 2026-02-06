@@ -40,6 +40,9 @@ static int wait_for_port(int port, int timeout_seconds) {
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         if (connect(s, (struct sockaddr*)&sa, sizeof(sa)) == 0) {
             close(s);
+            // Small delay to allow the server to finish handling this probe
+            // connection so it doesn't count towards max-conn in races.
+            usleep(200000);
             return 1;
         }
         close(s);
@@ -254,7 +257,7 @@ static int test_observability(void) {
 static int test_max_conn(void) {
     char *args[] = {SERVER_BIN, "--port", "1110", "--max-conn", "1", NULL};
     pid_t pid = start_server((char *const *)args, NULL);
-    int port = 1110;
+    int port = 1110;    
     if (!wait_for_port(port, 2)) { stop_server(pid); fprintf(stderr, "Server failed to start\n"); return 1; }
     unsigned char methods[] = {0x00};
     int method = -1;
