@@ -111,6 +111,39 @@ typedef struct socks5_server socks5_server;
 
 /* --- Internal Helpers --- */
 
+static char *xstrdup(const char *s) {
+  size_t len = strlen(s);
+  char *d = (char *)malloc(len + 1);
+  if (d)
+    memcpy(d, s, len + 1);
+  return d;
+}
+
+static void socks5_add_user(socks5_config *config, const char *username,
+                            const char *password) {
+  socks5_user *user = (socks5_user *)malloc(sizeof(socks5_user));
+  if (!user)
+    return;
+  user->username = xstrdup(username);
+  user->password = xstrdup(password);
+  user->next = config->users;
+  config->users = user;
+}
+
+static bool simple_auth_cb(void *ctx, const char *username,
+                           const char *password) {
+  socks5_server *server = (socks5_server *)ctx;
+  socks5_user *u = server->config.users;
+  while (u) {
+    if (strcmp(u->username, username) == 0 &&
+        strcmp(u->password, password) == 0) {
+      return true;
+    }
+    u = u->next;
+  }
+  return false;
+}
+
 static void socks5_log(const socks5_server *server, socks5_log_level level,
                        const char *fmt, ...) {
   if (!server->config.log_cb)
@@ -195,7 +228,7 @@ static void socks5_handle_client(void *arg) {
 
     bool authenticated = false;
     if (server->config.auth_cb)
-      authenticated = server->config.auth_cb(username, password);
+      authenticated = server->config.auth_cb(server, username, password);
 
     buf[0] = 0x01;
     buf[1] = authenticated ? 0x00 : 0x01;
@@ -395,6 +428,16 @@ void socks5_server_cleanup(socks5_server *server) {
   if (!server)
     return;
   socks5_server_stop(server);
+
+  socks5_user *u = server->config.users;
+  while (u) {
+    socks5_user *next = u->next;
+    free(u->username);
+    free(u->password);
+    free(u);
+    u = next;
+  }
+
   free(server);
 #ifdef _WIN32
   WSACleanup();
@@ -488,23 +531,92 @@ static void handle_signal(int sig) {
     socks5_server_stop(global_server);
 }
 
+static void print_usage(const char *prog) {
+  printf("Usage: %s [options] [port]\n", prog);
+  printf("Options:\n");
+  printf("  -p, --port <port>        Port to listen on (default: 1080)\n");
+  printf("  -b, --bind <ip>          Bind address (default: 0.0.0.0)\n");
+  printf("  -u, --user <user:pass>   Add user (enables auth). Can be used "
+         "multiple times.\n");
+  printf("  -h, --help               Show this help message\n");
+}
+
 static void logger(socks5_log_level level, const char *msg) {
-  (void)level;
-  printf("%s\n", msg);
+  const char *level_str = "INFO";
+  switch (level) {
+  case SOCKS5_LOG_WARN:
+    level_str = "WARN";
+    break;
+  case SOCKS5_LOG_ERROR:
+    level_str = "ERROR";
+    break;
+  case SOCKS5_LOG_DEBUG:
+    level_str = "DEBUG";
+    break;
+  default:
+    break;
+  }
+  printf("[%s] %s\n", msg, level_str);
 }
 
 int main(int argc, char **argv) {
-  uint16_t port = 1080;
-  if (argc > 1)
-    port = (uint16_t)atoi(argv[1]);
   signal(SIGINT, handle_signal);
   signal(SIGTERM, handle_signal);
+
   socks5_config config = {0};
-  config.port = port;
+  config.port = 1080;
   config.log_cb = logger;
+  config.bind_address = "0.0.0.0";
+
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+      print_usage(argv[0]);
+      return 0;
+    } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) {
+      if (++i < argc)
+        config.port = (uint16_t)atoi(argv[i]);
+    } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--bind") == 0) {
+      if (++i < argc)
+        config.bind_address = argv[i];
+    } else if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--user") == 0) {
+      if (++i < argc) {
+        char *u = xstrdup(argv[i]);
+        char *p = strchr(u, ':');
+        if (p) {
+          *p = '\0';
+          p++;
+          socks5_add_user(&config, u, p);
+          config.require_auth = true;
+          config.auth_cb = simple_auth_cb;
+        } else {
+          fprintf(stderr, "Invalid user format. Use user:pass\n");
+          free(u);
+          return 1;
+        }
+        free(u);
+      }
+    } else {
+      // Backward compatibility: first arg is port if not a flag
+      if (i == 1 && argv[i][0] != '-') {
+        config.port = (uint16_t)atoi(argv[i]);
+      } else {
+        fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+        print_usage(argv[0]);
+        return 1;
+      }
+    }
+  }
+
   global_server = socks5_server_init(&config);
-  if (!global_server)
+  if (!global_server) {
+    fprintf(stderr, "Failed to init server\n");
     return 1;
+  }
+
+  if (config.require_auth) {
+    printf("[INFO] Authentication enabled\n");
+  }
+
   socks5_server_run(global_server);
   socks5_server_cleanup(global_server);
   return 0;
