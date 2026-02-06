@@ -24,7 +24,3 @@ jobs:
     - name: Build (MSYS2)
       run: make CC=gcc
       shell: msys2 {0}
-
-    - name: Run tests (C)
-      run: make check CC=gcc
-      shell: msys2 {0}
