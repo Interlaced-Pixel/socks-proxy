@@ -19,7 +19,9 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 
 /* --- Constants & Protocol Definitions --- */
 
@@ -237,6 +239,7 @@ static int write_file_from_memory(const char *src, const char *dst, mode_t mode)
     return -1;
   }
 
+#ifndef _WIN32
   void *map = mmap(NULL, (size_t)size, PROT_READ, MAP_PRIVATE, in_fd, 0);
   if (map == MAP_FAILED) {
     close(in_fd);
@@ -268,13 +271,45 @@ static int write_file_from_memory(const char *src, const char *dst, mode_t mode)
   }
 
   munmap(map, (size_t)size);
+#else
+  /* Windows/MSYS2: mmap/sys/mman.h may be unavailable. Fall back to stdio read/write. */
+  if (close(in_fd) != 0)
+    return -1;
 
-  if (chmod(dst, mode) != 0) {
-    close(in_fd);
+  FILE *in = fopen(src, "rb");
+  if (!in)
+    return -1;
+
+  size_t need = (size_t)size;
+  char *buf = (char *)malloc(need);
+  if (!buf) {
+    fclose(in);
     return -1;
   }
 
-  close(in_fd);
+  size_t r = fread(buf, 1, need, in);
+  fclose(in);
+  if (r != need) {
+    free(buf);
+    return -1;
+  }
+
+  FILE *out = fopen(dst, "wb");
+  if (!out) {
+    free(buf);
+    return -1;
+  }
+  size_t w = fwrite(buf, 1, need, out);
+  fclose(out);
+  free(buf);
+  if (w != need)
+    return -1;
+#endif
+
+  if (chmod(dst, mode) != 0) {
+    return -1;
+  }
+
   return 0;
 }
 
