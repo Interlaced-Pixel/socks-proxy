@@ -1,4 +1,4 @@
-name: C/C++ CI
+name: Linux Build & Test
 
 on:
   push:
@@ -21,7 +21,5 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y clang
     - name: Build
       run: make
-    - name: Run tests
-      run: python3 tests.py
-      env:
-        PYTHONUNBUFFERED: '1'
+    - name: Run tests (C)
+      run: make check
