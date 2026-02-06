@@ -1,4 +1,12 @@
-CC = clang
+# Prefer clang if available, otherwise fall back to gcc
+ifneq ($(shell command -v clang 2>/dev/null),)
+CC := clang
+else ifneq ($(shell command -v gcc 2>/dev/null),)
+CC := gcc
+else
+CC := clang
+endif
+
 CFLAGS = -Wall -Wextra -O2 -I.
 LDFLAGS = -lpthread
 

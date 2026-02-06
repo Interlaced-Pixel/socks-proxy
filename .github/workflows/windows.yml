@@ -22,9 +22,9 @@ jobs:
           mingw-w64-x86_64-toolchain
 
     - name: Build (MSYS2)
-      run: make
+      run: make CC=gcc
       shell: msys2 {0}
 
     - name: Run tests (C)
-      run: make check
+      run: make check CC=gcc
       shell: msys2 {0}
