@@ -1199,7 +1199,7 @@ static const char *socks5_service_unit =
 "# Change User to a dedicated user if possible, e.g., 'socks5'\n"
 "User=nobody\n"
 "# Adjust path to where you install the binary\n"
-"ExecStart=/usr/local/bin/socks5 -u user:pass --port 1080 --max-conn 5000\n"
+"ExecStart=/usr/local/bin/socks5 --port 1080 --max-conn 5000\n"
 "# Restart automatically if it crashes\n"
 "Restart=on-failure\n"
 "RestartSec=5s\n"

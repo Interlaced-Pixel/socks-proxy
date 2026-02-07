@@ -4,3 +4,4 @@ tests.log
 .vscode/
 PLAN.md
 tests
+.DS_Store

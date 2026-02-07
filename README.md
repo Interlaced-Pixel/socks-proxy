@@ -25,6 +25,7 @@ make
 | `-u, --user <user:pass>` | Add user credentials (enables auth). Repeatable. |
 | `--max-conn <n>` | Max concurrent connections (default: 100) |
 | `--allow-ip <ip>` | Restrict access to specific client IPs. Repeatable. |
+| `-d, --debug` | Enable verbose debug logging |
 | `--install <mode>` | Install as a service (`systemd`) or to a path |
 | `--uninstall <mode>` | Uninstall service (`systemd`) or from a path |
 | `-h, --help` | Show help |
@@ -83,11 +84,11 @@ sudo ./socks5 --uninstall systemd
 
 ## Testing
 
-Tests require Python 3 and a compiled `socks5` binary in the project root.
-
-```sh
-make && python3 tests.py
-```
+Tests include a C-based test suite in `tests.c`.
+ 
+ ```sh
+ make check
+ ```
 
 ## License
 
