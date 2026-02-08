@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>socks-proxy | Lightweight SOCKS5 Server</title>
+    <meta name="description"
+        content="A lightweight, single-file SOCKS5 proxy server written in C. RFC 1928/1929 compliant.">
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;700&display=swap"
+        rel="stylesheet">
+
+    <style>
+        :root {
+            /* Color Palette - Clean Light Theme */
+            --bg-color: #ffffff;
+            --surface-color: #ffffff;
+            --surface-hover: #f9fafb;
+            --border-color: #e5e7eb;
+            --text-primary: #111827;
+            --text-secondary: #4b5563;
+            --accent-primary: #2563eb;
+            /* Royal Blue */
+            --accent-secondary: #0ea5e9;
+            /* Sky Blue */
+            /* Keep code components dark for contrast */
+            --code-bg: #1e1e1e;
+
+            --font-main: 'Inter', sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+
+            --spacing-unit: 8px;
+            --container-width: 1000px;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            font-family: var(--font-main);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            transition: color 0.2s;
+        }
+
+        a:hover {
+            color: var(--accent-primary);
+        }
+
+        /* Utility */
+        .container {
+            max-width: var(--container-width);
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 12px 24px;
+            font-weight: 600;
+            border-radius: 4px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            border: 1px solid transparent;
+        }
+
+        .btn-primary {
+            background-color: var(--accent-primary);
+            color: #ffffff;
+            box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.2);
+        }
+
+        .btn-primary:hover {
+            background-color: #1d4ed8;
+            box-shadow: 0 10px 15px -3px rgba(37, 99, 235, 0.3);
+            transform: translateY(-2px);
+        }
+
+        .btn-outline {
+            background: transparent;
+            border-color: var(--accent-primary);
+            color: var(--accent-primary);
+        }
+
+        .btn-outline:hover {
+            background: rgba(37, 99, 235, 0.05);
+            box-shadow: 0 0 15px rgba(37, 99, 235, 0.1);
+        }
+
+        /* Header */
+        header {
+            padding: 20px 0;
+            border-bottom: 1px solid var(--border-color);
+            position: sticky;
+            top: 0;
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(10px);
+            z-index: 100;
+        }
+
+        nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-family: var(--font-mono);
+            font-weight: 700;
+            font-size: 1.2rem;
+            color: var(--text-primary);
+        }
+
+        .logo span {
+            color: var(--accent-primary);
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 20px;
+        }
+
+        /* Hero Section */
+        .hero {
+            padding: 80px 0;
+            text-align: center;
+            position: relative;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: -100px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 600px;
+            height: 400px;
+            background: radial-gradient(circle, rgba(37, 99, 235, 0.1) 0%, rgba(255, 255, 255, 0) 70%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        .hero h1 {
+            font-size: 3.5rem;
+            font-weight: 800;
+            margin-bottom: 16px;
+            background: linear-gradient(90deg, #111827, #4b5563);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            line-height: 1.1;
+        }
+
+        .hero p {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin: 0 auto 40px;
+        }
+
+        .hero-cta {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            margin-bottom: 60px;
+        }
+
+        /* Terminal Animation - Keep Dark */
+        .terminal-window {
+            background: #1e1e1e;
+            border: 1px solid #333;
+            border-radius: 8px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.15);
+            max-width: 700px;
+            margin: 0 auto;
+            overflow: hidden;
+            text-align: left;
+            font-family: var(--font-mono);
+        }
+
+        .terminal-header {
+            background: #2d2d2d;
+            padding: 8px 16px;
+            display: flex;
+            gap: 6px;
+            border-bottom: 1px solid #333;
+        }
+
+        .dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .dot-red {
+            background: #ff5f56;
+        }
+
+        .dot-yellow {
+            background: #ffbd2e;
+        }
+
+        .dot-green {
+            background: #27c93f;
+        }
+
+        .terminal-body {
+            padding: 20px;
+            color: #d4d4d4;
+            font-size: 0.9rem;
+            height: 200px;
+        }
+
+        .prompt {
+            color: #27c93f;
+        }
+
+        .cmd {
+            color: #fff;
+        }
+
+        .output {
+            color: #a0a0a0;
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        .cursor {
+            display: inline-block;
+            width: 8px;
+            height: 15px;
+            background: #a0a0a0;
+            animation: blink 1s step-end infinite;
+            vertical-align: middle;
+        }
+
+        @keyframes blink {
+            50% {
+                opacity: 0;
+            }
+        }
+
+        /* Features Section */
+        .features {
+            padding: 80px 0;
+            background: #f9fafb;
+        }
+
+        .section-title {
+            text-align: center;
+            font-size: 2rem;
+            margin-bottom: 60px;
+            color: var(--text-primary);
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 24px;
+        }
+
+        .feature-card {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            padding: 32px;
+            border-radius: 8px;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .feature-card:hover {
+            transform: translateY(-5px);
+            border-color: var(--accent-primary);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.05);
+        }
+
+        .feature-icon {
+            font-size: 1.5rem;
+            margin-bottom: 16px;
+            color: var(--accent-primary);
+            font-family: var(--font-mono);
+        }
+
+        .feature-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: var(--text-primary);
+        }
+
+        .feature-desc {
+            color: var(--text-secondary);
+        }
+
+        /* Usage Section */
+        .usage {
+            padding: 80px 0;
+        }
+
+        .code-block {
+            background: var(--code-bg);
+            border: 1px solid #333;
+            color: #d4d4d4;
+            border-radius: 8px;
+            padding: 24px;
+            font-family: var(--font-mono);
+            overflow-x: auto;
+            position: relative;
+            margin-bottom: 24px;
+        }
+
+        .code-block::before {
+            content: attr(data-lang);
+            position: absolute;
+            top: 0;
+            right: 0;
+            background: #333;
+            padding: 4px 8px;
+            font-size: 0.75rem;
+            color: #fff;
+            border-bottom-left-radius: 4px;
+        }
+
+        .code-line {
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        .comment {
+            color: #6a9955;
+        }
+
+        .flag {
+            color: #569cd6;
+        }
+
+        /* Stats */
+        .stats {
+            display: flex;
+            justify-content: center;
+            gap: 60px;
+            margin-top: 40px;
+            flex-wrap: wrap;
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 3rem;
+            font-weight: 800;
+            color: var(--accent-primary);
+            font-family: var(--font-mono);
+        }
+
+        .stat-label {
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+
+        /* Footer */
+        footer {
+            border-top: 1px solid var(--border-color);
+            padding: 40px 0;
+            text-align: center;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            background: #f9fafb;
+        }
+
+        @media (max-width: 768px) {
+            .hero h1 {
+                font-size: 2.5rem;
+            }
+
+            .hero-cta {
+                flex-direction: column;
+            }
+
+            .stats {
+                gap: 30px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <header>
+        <div class="container">
+            <nav>
+                <div class="logo">
+                    &lt;socks-<span>proxy</span>/&gt;
+                </div>
+                <div class="nav-links">
+                    <a href="https://github.com/Interlaced-Pixel/socks-proxy" target="_blank">GitHub</a>
+                </div>
+            </nav>
+        </div>
+    </header>
+
+    <section class="hero">
+        <div class="container">
+            <h1>The Lightweight Proxy<br>You've Been Waiting For</h1>
+            <p>Single-file C11 implementation. Zero dependencies. RFC-compliant.</p>
+
+            <div class="hero-cta">
+                <a href="#usage" class="btn btn-primary">Get Started</a>
+                <a href="https://github.com/Interlaced-Pixel/socks-proxy" class="btn btn-outline" target="_blank">View
+                    Source</a>
+            </div>
+
+            <div class="terminal-window">
+                <div class="terminal-header">
+                    <div class="dot dot-red"></div>
+                    <div class="dot dot-yellow"></div>
+                    <div class="dot dot-green"></div>
+                </div>
+                <div class="terminal-body" id="terminal">
+                    <!-- Typewriter effect will populate this -->
+                    <span class="prompt">$</span> <span class="cmd">make</span><br>
+                    <span class="output">cc -std=c11 -O3 -pthread -o socks5 socks5.c</span>
+                    <span class="prompt">$</span> <span class="cmd">./socks5 --port 1080</span><br>
+                    <span class="output">[INFO] Starting SOCKS5 server on 0.0.0.0:1080</span>
+                    <span class="output">[INFO] Listening for connections...</span>
+                    <span class="prompt">$</span> <span class="cursor"></span>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="features">
+        <div class="container">
+            <h2 class="section-title">Why socks-proxy?</h2>
+
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">01.</div>
+                    <h3 class="feature-title">Ultra Lightweight</h3>
+                    <p class="feature-desc">Compiles to a tiny binary. Uses less than 5MB of memory under load. No
+                        external libraries required.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">02.</div>
+                    <h3 class="feature-title">RFC Compliant</h3>
+                    <p class="feature-desc">Full implementation of SOCKS5 (RFC 1928) and Username/Password
+                        Authentication (RFC 1929).</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">03.</div>
+                    <h3 class="feature-title">Cross Platform</h3>
+                    <p class="feature-desc">Write once, compile anywhere. Native support for Linux, macOS, and Windows.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">04.</div>
+                    <h3 class="feature-title">Secure & Controlled</h3>
+                    <p class="feature-desc">Built-in IP allowlisting and user authentication. Control exactly who uses
+                        your proxy.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">05.</div>
+                    <h3 class="feature-title">High Performance</h3>
+                    <p class="feature-desc">Multi-threaded architecture using pthreads to handle concurrent connections
+                        efficiently.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">06.</div>
+                    <h3 class="feature-title">UDP Support</h3>
+                    <p class="feature-desc">Supports UDP ASSOCIATE for applications requiring datagram transport.</p>
+                </div>
+            </div>
+
+            <div class="stats">
+                <div class="stat-item">
+                    <div class="stat-value">&lt;5MB</div>
+                    <div class="stat-label">Memory Usage</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">0</div>
+                    <div class="stat-label">Dependencies</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">100%</div>
+                    <div class="stat-label">C11 Standard</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="usage" id="usage">
+        <div class="container">
+            <h2 class="section-title">Get Up and Running</h2>
+
+            <div class="code-block" data-lang="BASH">
+                <span class="code-line"><span class="comment"># 1. Clone</span></span>
+                <span class="code-line">git clone https://github.com/InterlacedPixel/socks-proxy.git</span>
+                <span class="code-line">cd socks-proxy</span>
+                <br>
+                <span class="code-line"><span class="comment"># 2. Build</span></span>
+                <span class="code-line">make</span>
+                <br>
+                <span class="code-line"><span class="comment"># 3. Run (Default port 1080)</span></span>
+                <span class="code-line">./socks5</span>
+            </div>
+
+            <div class="code-block" data-lang="BASH">
+                <span class="code-line"><span class="comment"># Advanced Usage: Auth + Specific Port</span></span>
+                <span class="code-line">./socks5 <span class="flag">--port</span> 8080 <span class="flag">--user</span>
+                    admin:secret123</span>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <p>Released under PolyForm Noncommercial 1.0.0 License</p>
+            <p>&copy; 2026 InterlacedPixel. All rights reserved.</p>
+        </div>
+    </footer>
+
+</body>
+
+</html>
