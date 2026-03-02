@@ -15,7 +15,11 @@
 
 #include <stdatomic.h>
 
+#ifndef _WIN32
 #include <libgen.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <limits.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -185,13 +189,21 @@ static bool is_ip_allowed(const socks5_config *config, const char *ip_str) {
   return false;
 }
 
+static bool ct_strcmp(const char *a, const char *b) {
+  size_t la = strlen(a), lb = strlen(b);
+  if (la != lb) return false;
+  volatile unsigned char diff = 0;
+  for (size_t i = 0; i < la; i++) diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+  return diff == 0;
+}
+
 static bool simple_auth_cb(void *ctx, const char *username,
                            const char *password) {
   socks5_server *server = (socks5_server *)ctx;
   socks5_user *u = server->config.users;
   while (u) {
-    if (strcmp(u->username, username) == 0 &&
-        strcmp(u->password, password) == 0) {
+    if (ct_strcmp(u->username, username) &&
+        ct_strcmp(u->password, password)) {
       return true;
     }
     u = u->next;
@@ -374,6 +386,26 @@ static int confirm_prompt(const char *msg) {
   if (buf[0] == 'y' || buf[0] == 'Y')
     return 1;
   return 0;
+}
+
+static int run_systemctl(const char *args[], int nargs) {
+#ifndef _WIN32
+  pid_t pid = fork();
+  if (pid == 0) {
+    // Child
+    execvp("systemctl", (char * const *)args);
+    _exit(127); // exec failed
+  } else if (pid > 0) {
+    int status;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  } else {
+    return -1; // fork failed
+  }
+#else
+  // On Windows, systemctl doesn't exist, so just return success
+  return 0;
+#endif
 }
 
 typedef struct {
@@ -593,7 +625,8 @@ static void socks5_handle_client(void *arg) {
 
   buf[0] = SOCKS5_VERSION;
   buf[1] = (uint8_t)selected_method;
-  send(client_sock, (char *)buf, 2, 0);
+  if (send(client_sock, (char *)buf, 2, 0) != 2)
+    goto cleanup;
 
   if (selected_method == SOCKS5_AUTH_NO_ACCEPTABLE)
     goto cleanup;
@@ -632,7 +665,7 @@ static void socks5_handle_client(void *arg) {
       goto cleanup;
     password[plen] = '\0';
 
-    socks5_log(server, SOCKS5_LOG_DEBUG, "Auth request: user='%s' ulen=%u plen=%u", username, (unsigned)ulen, (unsigned)plen);
+    socks5_log(server, SOCKS5_LOG_DEBUG, "Auth request: ulen=%u plen=%u", (unsigned)ulen, (unsigned)plen);
 
     bool authenticated = false;
     if (server->config.auth_cb)
@@ -640,13 +673,14 @@ static void socks5_handle_client(void *arg) {
 
     buf[0] = 0x01;
     buf[1] = authenticated ? 0x00 : 0x01;
-    send(client_sock, (char *)buf, 2, 0);
+    if (send(client_sock, (char *)buf, 2, 0) != 2)
+      goto cleanup;
 
     if (!authenticated) {
-      socks5_log(server, SOCKS5_LOG_DEBUG, "Auth result: FAIL for user '%s'", username);
+      socks5_log(server, SOCKS5_LOG_DEBUG, "Auth result: FAIL");
       goto cleanup;
     }
-    socks5_log(server, SOCKS5_LOG_DEBUG, "Auth result: SUCCESS for user '%s'", username);
+    socks5_log(server, SOCKS5_LOG_DEBUG, "Auth result: SUCCESS");
   }
 
   // 3. Request
@@ -738,22 +772,26 @@ static void socks5_handle_client(void *arg) {
           buf[3] = SOCKS5_ADDR_IPV4;
           memcpy(buf + 4, &s->sin_addr, 4);
           memcpy(buf + 8, &s->sin_port, 2);
-          send(client_sock, (char *)buf, 10, 0);
+          if (send(client_sock, (char *)buf, 10, 0) != 10)
+            goto cleanup;
         } else if (local_addr.ss_family == AF_INET6) {
           struct sockaddr_in6 *s = (struct sockaddr_in6 *)&local_addr;
           buf[3] = SOCKS5_ADDR_IPV6;
           memcpy(buf + 4, &s->sin6_addr, 16);
           memcpy(buf + 20, &s->sin6_port, 2);
-          send(client_sock, (char *)buf, 22, 0);
+          if (send(client_sock, (char *)buf, 22, 0) != 22)
+            goto cleanup;
         } else {
           buf[3] = SOCKS5_ADDR_IPV4;
           memset(buf + 4, 0, 6);
-          send(client_sock, (char *)buf, 10, 0);
+          if (send(client_sock, (char *)buf, 10, 0) != 10)
+            goto cleanup;
         }
       } else {
         buf[3] = SOCKS5_ADDR_IPV4;
         memset(buf + 4, 0, 6);
-        send(client_sock, (char *)buf, 10, 0);
+        if (send(client_sock, (char *)buf, 10, 0) != 10)
+          goto cleanup;
       }
     } else {
       buf[1] = SOCKS5_REPLY_FAILURE;
@@ -806,7 +844,10 @@ static void socks5_handle_client(void *arg) {
     buf[3] = SOCKS5_ADDR_IPV4;
     memcpy(buf + 4, &assigned_addr.sin_addr, 4);
     memcpy(buf + 8, &assigned_addr.sin_port, 2);
-    send(client_sock, (char *)buf, 10, 0);
+    if (send(client_sock, (char *)buf, 10, 0) != 10) {
+      socks5_socket_close(bind_sock);
+      goto cleanup;
+    }
 
     // 3. Wait for connection (max 10s usually, we use our thread defaults)
     // We should probably set a timeout on bind_sock accept
@@ -841,12 +882,14 @@ static void socks5_handle_client(void *arg) {
       buf[3] = SOCKS5_ADDR_IPV4;
       memcpy(buf + 4, &s->sin_addr, 4);
       memcpy(buf + 8, &s->sin_port, 2);
-      send(client_sock, (char *)buf, 10, 0);
+      if (send(client_sock, (char *)buf, 10, 0) != 10)
+        goto cleanup;
     } else {
       // Assume IPv4 for short
       buf[3] = SOCKS5_ADDR_IPV4;
       memset(buf + 4, 0, 6);
-      send(client_sock, (char *)buf, 10, 0);
+      if (send(client_sock, (char *)buf, 10, 0) != 10)
+        goto cleanup;
     }
 
     socks5_log(server, SOCKS5_LOG_INFO, "BIND accepted connection");
@@ -908,7 +951,8 @@ static void socks5_handle_client(void *arg) {
       buf[3] = SOCKS5_ADDR_IPV4;
       memcpy(buf + 4, &s->sin_addr, 4);
       memcpy(buf + 8, &s->sin_port, 2);
-      send(client_sock, (char *)buf, 10, 0);
+      if (send(client_sock, (char *)buf, 10, 0) != 10)
+        goto cleanup;
     } else if (report_addr->sa_family == AF_INET6) {
       struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)report_addr;
       // Convert to an IPv4 reply (127.0.0.1) with the assigned port for
@@ -917,11 +961,13 @@ static void socks5_handle_client(void *arg) {
       struct in_addr loopback = { .s_addr = htonl(INADDR_LOOPBACK) };
       memcpy(buf + 4, &loopback, 4);
       memcpy(buf + 8, &s6->sin6_port, 2);
-      send(client_sock, (char *)buf, 10, 0);
+      if (send(client_sock, (char *)buf, 10, 0) != 10)
+        goto cleanup;
     } else {
       buf[3] = SOCKS5_ADDR_IPV4;
       memset(buf + 4, 0, 6);
-      send(client_sock, (char *)buf, 10, 0);
+      if (send(client_sock, (char *)buf, 10, 0) != 10)
+        goto cleanup;
     }
 
     // 3. UDP Relay Loop
@@ -952,7 +998,7 @@ static void socks5_handle_client(void *arg) {
         if (recv(client_sock, tmp, 1, MSG_PEEK) <= 0) {
           break;
         }
-        recv(client_sock, tmp, 1, 0);
+        // Do not consume data; only monitor for connection closure
       }
 
       if (FD_ISSET(udp_sock, &fds)) {
@@ -1225,6 +1271,31 @@ void socks5_server_cleanup(socks5_server *server) {
 #endif
 }
 
+static void socks5_config_cleanup(socks5_config *config) {
+  if (!config)
+    return;
+  socks5_user *u = config->users;
+  while (u) {
+    socks5_user *next = u->next;
+    free(u->username);
+    free(u->password);
+    free(u);
+    u = next;
+  }
+  for (int i = 0; i < config->allow_ip_count; i++) {
+    free(config->allow_ips[i]);
+  }
+  free(config->allow_ips);
+}
+
+static socks5_server *global_server = NULL;
+static volatile sig_atomic_t g_stop = 0;
+
+static void handle_signal(int sig) {
+  (void)sig;
+  g_stop = 1;
+}
+
 int socks5_server_run(socks5_server *server) {
   if (!server)
     return -1;
@@ -1258,13 +1329,15 @@ int socks5_server_run(socks5_server *server) {
   }
   server->running = true;
   socks5_log(server, SOCKS5_LOG_INFO, "Listening on %u", server->config.port);
-  while (server->running) {
+  while (server->running && !g_stop) {
     struct sockaddr_storage addr;
     socklen_t len = sizeof(addr);
     socks5_socket client =
         accept(server->listen_sock, (struct sockaddr *)&addr, &len);
-    if (client == SOCKS5_INVALID_SOCKET)
+    if (client == SOCKS5_INVALID_SOCKET) {
+      if (g_stop) break;
       continue;
+    }
 
     int prev = atomic_fetch_add(&server->active_connections, 1);
     if (prev >= server->config.max_connections) {
@@ -1313,14 +1386,6 @@ int socks5_server_run(socks5_server *server) {
 }
 
 /* --- Main --- */
-
-static socks5_server *global_server = NULL;
-
-static void handle_signal(int sig) {
-  (void)sig;
-  if (global_server)
-    socks5_server_stop(global_server);
-}
 
 static void print_usage(const char *prog) {
   printf("Usage: %s [options] [port]\n", prog);
@@ -1441,9 +1506,12 @@ int main(int argc, char **argv) {
             }
             printf("Installed systemd unit -> %s\n", svc_dst);
             // Try to enable and start
-            int r = system("systemctl daemon-reload && systemctl enable --now socks5.service");
-            if (r != 0) {
-              fprintf(stderr, "Warning: systemctl failed (exit %d). You may need to enable/start the service manually.\n", r);
+            const char *daemon_reload_args[] = {"systemctl", "daemon-reload", NULL};
+            int r1 = run_systemctl(daemon_reload_args, 2);
+            const char *enable_args[] = {"systemctl", "enable", "--now", "socks5.service", NULL};
+            int r2 = run_systemctl(enable_args, 4);
+            if (r1 != 0 || r2 != 0) {
+              fprintf(stderr, "Warning: systemctl failed (daemon-reload: %d, enable: %d). You may need to enable/start the service manually.\n", r1, r2);
             } else {
               printf("socks5.service enabled and started\n");
             }
@@ -1509,9 +1577,14 @@ int main(int argc, char **argv) {
           }
 
           // Try to stop and disable the service
-          int r = system("systemctl stop socks5.service 2>/dev/null || true; systemctl disable socks5.service 2>/dev/null || true; systemctl daemon-reload 2>/dev/null || true");
-          if (r != 0) {
-            fprintf(stderr, "Warning: systemctl returned non-zero (exit %d); you may need to stop/disable the service manually.\n", r);
+          const char *stop_args[] = {"systemctl", "stop", "socks5.service", NULL};
+          int r1 = run_systemctl(stop_args, 3);
+          const char *disable_args[] = {"systemctl", "disable", "socks5.service", NULL};
+          int r2 = run_systemctl(disable_args, 3);
+          const char *reload_args[] = {"systemctl", "daemon-reload", NULL};
+          int r3 = run_systemctl(reload_args, 2);
+          if (r1 != 0 || r2 != 0 || r3 != 0) {
+            fprintf(stderr, "Warning: systemctl commands failed (stop: %d, disable: %d, reload: %d); you may need to stop/disable the service manually.\n", r1, r2, r3);
           } else {
             printf("Stopped and disabled socks5.service (if it was running).\n");
           }
@@ -1589,6 +1662,7 @@ int main(int argc, char **argv) {
         } else {
           fprintf(stderr, "Invalid user format. Use user:pass\n");
           free(u);
+          socks5_config_cleanup(&config);
           return 1;
         }
         free(u);
@@ -1624,6 +1698,8 @@ int main(int argc, char **argv) {
   }
 
   socks5_server_run(global_server);
+  if (g_stop && global_server)
+    socks5_server_stop(global_server);
   socks5_server_cleanup(global_server);
   return 0;
 }
