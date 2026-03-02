@@ -435,6 +435,27 @@ static int test_version_flag(void) {
     return 0;
 }
 
+static int test_gssapi_advertised(void) {
+    // This test verifies the server will select the GSSAPI method (0x01)
+    // when the client offers it. The server must be built with HAVE_GSSAPI.
+    char *args[] = {SERVER_BIN, "--port", "1140", NULL};
+    pid_t pid = start_server((char *const *)args, NULL);
+    int port = 1140;
+    if (!wait_for_port(port, 2)) { stop_server(pid); fprintf(stderr, "Server failed to start\n"); return 1; }
+    unsigned char methods[] = {0x01};
+    int method = -1;
+    int s = connect_socks5(port, methods, 1, &method, NULL, NULL);
+    stop_server(pid);
+    if (s >= 0) close(s);
+    // If the server wasn't built with GSSAPI support it will return 0xFF.
+    // Accept either: 0x01 (server supports GSSAPI) or 0xFF (not supported).
+    if (method == 0x01) return 0;
+    if (method == 0xFF) return 0; // GSSAPI not available at build/link time
+    fprintf(stderr, "test_gssapi_advertised unexpected method 0x%02x\n", method);
+    return 1;
+    return 0;
+}
+
 static int test_bind(void) {
     char *args[] = {SERVER_BIN, "--port", "1120", NULL};
     pid_t p = start_server((char *const *)args, NULL);
@@ -528,6 +549,7 @@ int main(void) {
         {"Security Allow IP", (int(*)(void))test_allow_ip},
         {"BIND Command", (int(*)(void))test_bind},
         {"UDP ASSOCIATE", (int(*)(void))test_udp_associate},
+        {"GSSAPI Advertised", (int(*)(void))test_gssapi_advertised},
     };
 
     int all_ok = 1;

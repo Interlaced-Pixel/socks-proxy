@@ -23,6 +23,10 @@
 #include <sys/mman.h>
 #endif
 
+#ifdef HAVE_GSSAPI
+#include <gssapi/gssapi.h>
+#endif
+
 /* --- Constants & Protocol Definitions --- */
 
 #define SOCKS5_VERSION 0x05
@@ -30,8 +34,8 @@
 // Program version (semantic versioning)
 #define SOCKS5_VERSION_MAJOR 0
 #define SOCKS5_VERSION_MINOR 1
-#define SOCKS5_VERSION_PATCH 2
-#define SOCKS5_VERSION_STR "0.1.2"
+#define SOCKS5_VERSION_PATCH 3
+#define SOCKS5_VERSION_STR "0.1.3"
 
 // Authentication methods
 #define SOCKS5_AUTH_NONE 0x00
@@ -386,6 +390,107 @@ static int read_exact(socks5_socket s, void *buf, size_t len) {
   return 0;
 }
 
+#ifdef HAVE_GSSAPI
+// Perform GSSAPI (RFC 1961) token exchange with the client.
+// Tokens are framed as 2-byte big-endian length followed by token bytes.
+static int socks5_do_gssapi_auth(socks5_server *server, socks5_socket client_sock) {
+  OM_uint32 major = 0, minor = 0;
+  gss_ctx_id_t ctx = GSS_C_NO_CONTEXT;
+  gss_name_t client_name = GSS_C_NO_NAME;
+  int established = 0;
+
+  while (!established) {
+    uint8_t lenbuf[2];
+    if (read_exact(client_sock, lenbuf, 2) != 0) {
+      socks5_log(server, SOCKS5_LOG_DEBUG, "GSSAPI: failed reading token length");
+      goto fail;
+    }
+    uint16_t in_len = (uint16_t)ntohs(*(uint16_t *)lenbuf);
+
+
+    gss_buffer_desc in_tok = GSS_C_EMPTY_BUFFER;
+    in_tok.length = in_len;
+    in_tok.value = NULL;
+    if (in_len) {
+      in_tok.value = malloc(in_len);
+      if (!in_tok.value) goto fail;
+      if (read_exact(client_sock, in_tok.value, in_len) != 0) {
+        free(in_tok.value);
+        socks5_log(server, SOCKS5_LOG_DEBUG, "GSSAPI: failed reading token payload");
+        goto fail;
+      }
+    }
+
+    gss_buffer_desc out_tok = GSS_C_EMPTY_BUFFER;
+
+    major = gss_accept_sec_context(&minor, &ctx, GSS_C_NO_CREDENTIAL, &in_tok,
+                                   GSS_C_NO_CHANNEL_BINDINGS, &client_name,
+                                   NULL, &out_tok, NULL, NULL, NULL);
+    if (in_tok.value) {
+      free(in_tok.value);
+      in_tok.value = NULL;
+    }
+
+    if (out_tok.length && out_tok.value) {
+      uint16_t out_len = (uint16_t)out_tok.length;
+      uint16_t be = htons(out_len);
+      if (send(client_sock, (char *)&be, 2, 0) != 2) {
+        gss_release_buffer(&minor, &out_tok);
+        goto fail;
+      }
+      if (send(client_sock, (char *)out_tok.value, (int)out_tok.length, 0) != (ssize_t)out_tok.length) {
+        gss_release_buffer(&minor, &out_tok);
+        goto fail;
+      }
+      gss_release_buffer(&minor, &out_tok);
+    } else {
+      uint16_t zero = 0;
+      uint16_t be = htons(zero);
+      if (send(client_sock, (char *)&be, 2, 0) != 2) {
+      uint16_t be = htons(0);
+    }
+
+    if (GSS_ERROR(major)) {
+      socks5_log(server, SOCKS5_LOG_DEBUG, "GSSAPI: accept_sec_context failed major=0x%08x minor=0x%08x", major, minor);
+      goto fail;
+    }
+
+    if (major == GSS_S_CONTINUE_NEEDED) {
+      continue; // expect more tokens
+    }
+
+    if (major == GSS_S_COMPLETE) {
+      established = 1;
+      break;
+    }
+  }
+
+  if (established) {
+    // Optionally obtain display name for logging
+    if (client_name != GSS_C_NO_NAME) {
+      OM_uint32 lmin = 0;
+      gss_buffer_desc name_buf = GSS_C_EMPTY_BUFFER;
+      if (gss_display_name(&lmin, client_name, &name_buf, NULL) == GSS_S_COMPLETE) {
+        socks5_log(server, SOCKS5_LOG_INFO, "GSSAPI auth succeeded for principal: %.*s", (int)name_buf.length, (char *)name_buf.value);
+        gss_release_buffer(&lmin, &name_buf);
+      }
+      gss_release_name(&minor, &client_name);
+    }
+    if (ctx != GSS_C_NO_CONTEXT) {
+      gss_delete_sec_context(&minor, &ctx, GSS_C_NO_BUFFER);
+    }
+    return 0;
+  }
+
+fail:
+  if (client_name != GSS_C_NO_NAME)
+    gss_release_name(&minor, &client_name);
+  if (ctx != GSS_C_NO_CONTEXT)
+    gss_delete_sec_context(&minor, &ctx, GSS_C_NO_BUFFER);
+  return -1;
+}
+#endif
+
 static void socks5_handle_client(void *arg) {
   socks5_session *session = (socks5_session *)arg;
   socks5_server *server = session->server;
@@ -441,14 +546,35 @@ static void socks5_handle_client(void *arg) {
     socks5_log(server, SOCKS5_LOG_DEBUG, "Methods: [%s]", mlist);
   }
 
+  /* Select the first acceptable method in the client's offered order.
+     Server policy: prefer the client's order but only accept methods the
+     server actually supports/configures. GSSAPI is only considered when
+     built with HAVE_GSSAPI. Username/Password is accepted when the server
+     requires auth or when an auth callback/users are configured. */
   int selected_method = SOCKS5_AUTH_NO_ACCEPTABLE;
   for (int i = 0; i < nmethods; i++) {
-    if (buf[i] == SOCKS5_AUTH_NONE && !server->config.require_auth) {
-      selected_method = SOCKS5_AUTH_NONE;
+    uint8_t m = buf[i];
+    if (m == SOCKS5_AUTH_GSSAPI) {
+#ifdef HAVE_GSSAPI
+      selected_method = SOCKS5_AUTH_GSSAPI;
       break;
-    } else if (buf[i] == SOCKS5_AUTH_USER_PASS && server->config.require_auth) {
-      selected_method = SOCKS5_AUTH_USER_PASS;
-      break;
+#else
+      continue;
+#endif
+    }
+    if (m == SOCKS5_AUTH_USER_PASS) {
+      if (server->config.require_auth || server->config.auth_cb || server->config.users) {
+        selected_method = SOCKS5_AUTH_USER_PASS;
+        break;
+      }
+      continue;
+    }
+    if (m == SOCKS5_AUTH_NONE) {
+      if (!server->config.require_auth) {
+        selected_method = SOCKS5_AUTH_NONE;
+        break;
+      }
+      continue;
     }
   }
   socks5_log(server, SOCKS5_LOG_DEBUG, "Selected method: 0x%02x", selected_method);
@@ -461,6 +587,18 @@ static void socks5_handle_client(void *arg) {
     goto cleanup;
 
   // 2. Auth
+  if (selected_method == SOCKS5_AUTH_GSSAPI) {
+#ifdef HAVE_GSSAPI
+    socks5_log(server, SOCKS5_LOG_DEBUG, "Starting GSSAPI authentication");
+    if (socks5_do_gssapi_auth(server, client_sock) != 0) {
+      socks5_log(server, SOCKS5_LOG_WARN, "GSSAPI authentication failed");
+      goto cleanup;
+    }
+    socks5_log(server, SOCKS5_LOG_DEBUG, "GSSAPI authentication completed");
+#else
+    goto cleanup;
+#endif
+  }
   if (selected_method == SOCKS5_AUTH_USER_PASS) {
     if (read_exact(client_sock, buf, 2) != 0)
       goto cleanup;
