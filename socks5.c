@@ -137,7 +137,7 @@ typedef struct {
 struct socks5_server {
   socks5_config config;
   socks5_socket listen_sock;
-  volatile bool running;
+  _Atomic bool running;
   _Atomic int active_connections;
 };
 
@@ -165,12 +165,13 @@ static void socks5_add_user(socks5_config *config, const char *username,
 }
 
 static void socks5_add_allow_ip(socks5_config *config, const char *ip) {
-  config->allow_ips = (char **)realloc(
+  char **tmp = (char **)realloc(
       config->allow_ips, sizeof(char *) * (config->allow_ip_count + 1));
-  if (config->allow_ips) {
-    config->allow_ips[config->allow_ip_count] = xstrdup(ip);
-    config->allow_ip_count++;
-  }
+  if (!tmp)
+    return;
+  config->allow_ips = tmp;
+  config->allow_ips[config->allow_ip_count] = xstrdup(ip);
+  config->allow_ip_count++;
 }
 
 static bool is_ip_allowed(const socks5_config *config, const char *ip_str) {
@@ -209,7 +210,14 @@ static void socks5_log(const socks5_server *server, socks5_log_level level,
   char time_buf[64];
 
   time_t now = time(NULL);
-  struct tm *t = localtime(&now);
+#ifdef _WIN32
+  struct tm tm_buf;
+  localtime_s(&tm_buf, &now);
+  struct tm *t = &tm_buf;
+#else
+  struct tm tm_buf;
+  struct tm *t = localtime_r(&now, &tm_buf);
+#endif
   strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", t);
 
   va_list args;
@@ -405,7 +413,9 @@ static int socks5_do_gssapi_auth(socks5_server *server, socks5_socket client_soc
       socks5_log(server, SOCKS5_LOG_DEBUG, "GSSAPI: failed reading token length");
       goto fail;
     }
-    uint16_t in_len = (uint16_t)ntohs(*(uint16_t *)lenbuf);
+    uint16_t in_len_be;
+    memcpy(&in_len_be, lenbuf, sizeof(in_len_be));
+    uint16_t in_len = ntohs(in_len_be);
 
 
     gss_buffer_desc in_tok = GSS_C_EMPTY_BUFFER;
@@ -534,7 +544,7 @@ static void socks5_handle_client(void *arg) {
     goto cleanup;
 
   int nmethods = buf[1];
-  if (nmethods <= 0 || nmethods > (int)sizeof(buf))
+  if (nmethods <= 0 || nmethods > 255)
     goto cleanup;
   if (read_exact(client_sock, buf, (size_t)nmethods) != 0)
     goto cleanup;
@@ -617,8 +627,6 @@ static void socks5_handle_client(void *arg) {
     if (read_exact(client_sock, buf, 1) != 0)
       goto cleanup;
     uint8_t plen = buf[0];
-    if (plen > 255)
-      goto cleanup;
     char password[256];
     if (read_exact(client_sock, password, plen) != 0)
       goto cleanup;
@@ -634,12 +642,11 @@ static void socks5_handle_client(void *arg) {
     buf[1] = authenticated ? 0x00 : 0x01;
     send(client_sock, (char *)buf, 2, 0);
 
-    if (!authenticated)
+    if (!authenticated) {
       socks5_log(server, SOCKS5_LOG_DEBUG, "Auth result: FAIL for user '%s'", username);
-    else
-      socks5_log(server, SOCKS5_LOG_DEBUG, "Auth result: SUCCESS for user '%s'", username);
-
-    goto cleanup;
+      goto cleanup;
+    }
+    socks5_log(server, SOCKS5_LOG_DEBUG, "Auth result: SUCCESS for user '%s'", username);
   }
 
   // 3. Request
@@ -1031,6 +1038,9 @@ static void socks5_handle_client(void *arg) {
               if (res->ai_addrlen <= sizeof(target_addr)) {
                 memcpy(&target_addr, res->ai_addr, res->ai_addrlen);
                 target_len = (socklen_t)res->ai_addrlen;
+              } else {
+                freeaddrinfo(res);
+                continue;
               }
               freeaddrinfo(res);
               header_len = 4 + 1 + dlen + 2;
@@ -1256,14 +1266,14 @@ int socks5_server_run(socks5_server *server) {
     if (client == SOCKS5_INVALID_SOCKET)
       continue;
 
-    int active = atomic_load(&server->active_connections);
-    if (active >= server->config.max_connections) {
+    int prev = atomic_fetch_add(&server->active_connections, 1);
+    if (prev >= server->config.max_connections) {
+      atomic_fetch_sub(&server->active_connections, 1);
       socks5_log(server, SOCKS5_LOG_WARN,
-                 "Max connections reached (%d), rejecting", active);
+                 "Max connections reached (%d), rejecting", prev);
       socks5_socket_close(client);
       continue;
     }
-    atomic_fetch_add(&server->active_connections, 1);
 
 #ifdef _WIN32
     DWORD timeout = server->config.timeout_seconds * 1000;
@@ -1295,6 +1305,7 @@ int socks5_server_run(socks5_server *server) {
     else {
       socks5_socket_close(client);
       free(session);
+      atomic_fetch_sub(&server->active_connections, 1);
     }
 #endif
   }
