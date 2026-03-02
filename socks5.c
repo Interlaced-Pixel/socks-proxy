@@ -587,6 +587,69 @@ static void ev_del(int ev_fd, sock_t fd) {
 }
 
 /* ================================================================
+ * DNS Cache — avoids repeated blocking getaddrinfo() calls in the
+ * single-threaded event loop.  First lookup for a host still blocks;
+ * subsequent lookups within DNS_CACHE_TTL seconds are served instantly.
+ * ================================================================ */
+
+#define DNS_CACHE_SLOTS 256
+#define DNS_CACHE_TTL   60
+
+typedef struct {
+  char              host[256];
+  char              port[8];
+  struct sockaddr_storage addr;
+  socklen_t         addrlen;
+  int               family;
+  int               socktype;
+  int               protocol;
+  time_t            expiry;
+} dns_cache_slot;
+
+static dns_cache_slot g_dns_cache[DNS_CACHE_SLOTS];
+
+static unsigned int dns_hash(const char *host, const char *port) {
+  unsigned int h = 5381;
+  while (*host) h = h * 33u ^ (unsigned char)*host++;
+  while (*port)  h = h * 33u ^ (unsigned char)*port++;
+  return h % DNS_CACHE_SLOTS;
+}
+
+static int dns_cache_lookup(const char *host, const char *port,
+                            struct sockaddr_storage *out_addr,
+                            socklen_t *out_addrlen,
+                            int *out_family, int *out_type, int *out_proto) {
+  unsigned int slot = dns_hash(host, port);
+  dns_cache_slot *s = &g_dns_cache[slot];
+  if (s->expiry == 0) return 0;
+  if (time(NULL) > s->expiry) { s->expiry = 0; return 0; }
+  if (strcmp(s->host, host) != 0 || strcmp(s->port, port) != 0) return 0;
+  *out_addr    = s->addr;
+  *out_addrlen = s->addrlen;
+  *out_family  = s->family;
+  *out_type    = s->socktype;
+  *out_proto   = s->protocol;
+  return 1;
+}
+
+static void dns_cache_store(const char *host, const char *port,
+                            const struct addrinfo *ai) {
+  if (ai->ai_addrlen > sizeof(((dns_cache_slot*)0)->addr)) return;
+  unsigned int slot = dns_hash(host, port);
+  dns_cache_slot *s = &g_dns_cache[slot];
+  strncpy(s->host, host, sizeof(s->host) - 1);
+  s->host[sizeof(s->host) - 1] = '\0';
+  strncpy(s->port, port, sizeof(s->port) - 1);
+  s->port[sizeof(s->port) - 1] = '\0';
+  memcpy(&s->addr, ai->ai_addr, ai->ai_addrlen);
+  s->addrlen  = (socklen_t)ai->ai_addrlen;
+  s->family   = ai->ai_family;
+  s->socktype = ai->ai_socktype;
+  s->protocol = ai->ai_protocol;
+  s->expiry   = time(NULL) + DNS_CACHE_TTL;
+}
+
+/* ================================================================
  * Connection Management
  * ================================================================ */
 
@@ -1023,17 +1086,30 @@ static void process_request(conn_t *c) {
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", dst_port);
 
-    if (getaddrinfo(dst_addr, port_str, &hints, &res) != 0) {
-      /* DNS failure */
+    struct sockaddr_storage cached_addr;
+    socklen_t cached_addrlen;
+    int cached_family, cached_type, cached_proto;
+    if (dns_cache_lookup(dst_addr, port_str,
+                         &cached_addr, &cached_addrlen,
+                         &cached_family, &cached_type, &cached_proto)) {
+      struct addrinfo ai_hit = {0};
+      ai_hit.ai_family   = cached_family;
+      ai_hit.ai_socktype = cached_type;
+      ai_hit.ai_protocol = cached_proto;
+      ai_hit.ai_addrlen  = cached_addrlen;
+      ai_hit.ai_addr     = (struct sockaddr *)&cached_addr;
+      start_async_connect(c, &ai_hit);
+    } else if (getaddrinfo(dst_addr, port_str, &hints, &res) != 0) {
       uint8_t rep[10] = {SOCKS5_VERSION, SOCKS5_REPLY_HOST_UNREACHABLE,
                          0x00, SOCKS5_ADDR_IPV4, 0,0,0,0, 0,0};
       send(c->client_fd, (char *)rep, 10, 0);
       conn_mark_dead(c);
       return;
+    } else {
+      dns_cache_store(dst_addr, port_str, res);
+      start_async_connect(c, res);
+      freeaddrinfo(res);
     }
-
-    start_async_connect(c, res);
-    freeaddrinfo(res);
     return;
   }
 
@@ -1413,8 +1489,13 @@ static void handle_relay_write(conn_t *c, sock_t fd) {
   c->flags &= ~flag;
   ev_disable_write(c->server->ev_fd, fd, c);
 
-  /* Now try to read more from source */
-  (void)src_fd;
+  /* Continue draining source — EV_CLEAR already consumed the readable
+   * edge for any kernel-buffered data; without an explicit pump here the
+   * relay stalls permanently until the remote sends *new* bytes, which
+   * never happens when the server already sent a complete response. */
+  uint64_t *stat = (fd == c->remote_fd) ? &c->bytes_sent : &c->bytes_recv;
+  int r = relay_data(c, src_fd, fd, buf, len, off, flag, stat);
+  if (r < 0) conn_mark_dead(c);
 }
 
 /* ================================================================
