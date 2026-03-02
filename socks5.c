@@ -447,7 +447,9 @@ static int socks5_do_gssapi_auth(socks5_server *server, socks5_socket client_soc
       uint16_t zero = 0;
       uint16_t be = htons(zero);
       if (send(client_sock, (char *)&be, 2, 0) != 2) {
-      uint16_t be = htons(0);
+        socks5_log(server, SOCKS5_LOG_DEBUG, "GSSAPI: failed sending zero-length token");
+        goto fail;
+      }
     }
 
     if (GSS_ERROR(major)) {

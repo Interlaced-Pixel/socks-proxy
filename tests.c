@@ -453,7 +453,6 @@ static int test_gssapi_advertised(void) {
     if (method == 0xFF) return 0; // GSSAPI not available at build/link time
     fprintf(stderr, "test_gssapi_advertised unexpected method 0x%02x\n", method);
     return 1;
-    return 0;
 }
 
 static int test_bind(void) {
