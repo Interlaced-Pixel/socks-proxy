@@ -38,8 +38,8 @@
 // Program version (semantic versioning)
 #define SOCKS5_VERSION_MAJOR 0
 #define SOCKS5_VERSION_MINOR 1
-#define SOCKS5_VERSION_PATCH 3
-#define SOCKS5_VERSION_STR "0.1.3"
+#define SOCKS5_VERSION_PATCH 4
+#define SOCKS5_VERSION_STR "0.1.4"
 
 // Authentication methods
 #define SOCKS5_AUTH_NONE 0x00
@@ -169,23 +169,62 @@ static void socks5_add_user(socks5_config *config, const char *username,
 }
 
 static void socks5_add_allow_ip(socks5_config *config, const char *ip) {
+  if (!ip || ip[0] == '\0')
+    return;
+
+  int lo = 0;
+  int hi = config->allow_ip_count;
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    int cmp = strcmp(config->allow_ips[mid], ip);
+    if (cmp < 0)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+
+  if (lo < config->allow_ip_count &&
+      strcmp(config->allow_ips[lo], ip) == 0) {
+    return;
+  }
+
+  char *dup_ip = xstrdup(ip);
+  if (!dup_ip)
+    return;
+
   char **tmp = (char **)realloc(
       config->allow_ips, sizeof(char *) * (config->allow_ip_count + 1));
-  if (!tmp)
+  if (!tmp) {
+    free(dup_ip);
     return;
+  }
+
+  if (lo < config->allow_ip_count) {
+    memmove(&tmp[lo + 1], &tmp[lo],
+            (size_t)(config->allow_ip_count - lo) * sizeof(char *));
+  }
+  tmp[lo] = dup_ip;
   config->allow_ips = tmp;
-  config->allow_ips[config->allow_ip_count] = xstrdup(ip);
   config->allow_ip_count++;
 }
 
 static bool is_ip_allowed(const socks5_config *config, const char *ip_str) {
   if (config->allow_ip_count == 0)
     return true; // No whitelist = allow all
-  for (int i = 0; i < config->allow_ip_count; i++) {
-    if (strcmp(config->allow_ips[i], ip_str) == 0) {
+
+  int lo = 0;
+  int hi = config->allow_ip_count;
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    int cmp = strcmp(config->allow_ips[mid], ip_str);
+    if (cmp == 0)
       return true;
-    }
+    if (cmp < 0)
+      lo = mid + 1;
+    else
+      hi = mid;
   }
+
   return false;
 }
 
