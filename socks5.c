@@ -18,6 +18,11 @@
  *   - Compact connection struct (~200 bytes active relay state)
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
+
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
