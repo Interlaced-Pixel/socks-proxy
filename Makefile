@@ -45,6 +45,10 @@ tests: $(TEST_SRCS)
 	$(CC) $(CFLAGS) $(TEST_SRCS) -o $(TESTS) $(LDFLAGS)
 
 check: all tests
+	@echo "Building server with GSSAPI enabled for strict tests..."
+	@$(MAKE) clean
+	@$(MAKE) GSSAPI=1 all tests
+	@echo "Running tests against GSSAPI-enabled server"
 	./$(TESTS)
 
 clean:

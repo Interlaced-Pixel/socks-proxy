@@ -447,12 +447,9 @@ static int test_gssapi_advertised(void) {
     int s = connect_socks5(port, methods, 1, &method, NULL, NULL);
     stop_server(pid);
     if (s >= 0) close(s);
-    // If the server wasn't built with GSSAPI support it will return 0xFF.
-    // Accept either: 0x01 (server supports GSSAPI) or 0xFF (not supported).
-    if (method == 0x01) return 0;
-    if (method == 0xFF) return 0; // GSSAPI not available at build/link time
-    fprintf(stderr, "test_gssapi_advertised unexpected method 0x%02x\n", method);
-    return 1;
+    // Require the server to support GSSAPI for this strict test.
+    if (method != 0x01) { fprintf(stderr, "test_gssapi_advertised expected 0x01 got 0x%02x\n", method); return 1; }
+    return 0;
 }
 
 static int test_bind(void) {
