@@ -2079,10 +2079,11 @@ int socks5_server_run(socks5_server *server) {
       int is_eof = (events[i].flags & EV_EOF) != 0;
 #elif USE_EPOLL
       void *udata = events[i].data.ptr;
-      sock_t fd = -1; /* epoll doesn't give us fd directly with ptr mode */
+      sock_t fd = -1; /* not used in epoll path; retained to avoid ifdef churn */
       int is_read = (events[i].events & EPOLLIN) != 0;
       int is_write = (events[i].events & EPOLLOUT) != 0;
       int is_eof = (events[i].events & (EPOLLHUP | EPOLLERR)) != 0;
+      (void)fd;
 #endif
 
       if (udata == NULL) {
@@ -2094,13 +2095,6 @@ int socks5_server_run(socks5_server *server) {
       conn_t *c = (conn_t *)udata;
       if (c->flags & CONN_FLAG_DEAD) continue;
 
-#if USE_EPOLL
-      /* Determine fd from connection context */
-      /* With epoll + ptr mode, we need to figure out which fd fired.
-       * We handle this by processing both read and write if set. */
-      fd = c->client_fd; /* default; relay handlers check internally */
-#endif
-
       if (is_eof && !is_read && !is_write) {
         conn_mark_dead(c);
         continue;
@@ -2110,10 +2104,26 @@ int socks5_server_run(socks5_server *server) {
       if (is_read) on_readable(c, fd);
       if (is_write && !(c->flags & CONN_FLAG_DEAD)) on_writable(c, fd);
 #elif USE_EPOLL
-      /* For epoll, we can't distinguish which fd fired when using ptr mode.
-       * Handle both directions. */
-      if (is_read) on_readable(c, c->client_fd);
-      if (is_write && !(c->flags & CONN_FLAG_DEAD)) on_writable(c, c->client_fd);
+      /* epoll data.ptr carries conn_t* but loses the originating fd.
+       * Fan out to every registered fd that belongs to this connection.
+       * on_readable / on_writable are safe to call on an fd with no data
+       * ready — relay_data returns 0 immediately on EAGAIN, and the
+       * handshake-phase handlers read hardcoded from client_fd regardless
+       * of the fd argument. */
+      if (is_read) {
+        if (c->client_fd != INVALID_SOCK)
+          on_readable(c, c->client_fd);
+        if (!(c->flags & CONN_FLAG_DEAD) && c->remote_fd != INVALID_SOCK)
+          on_readable(c, c->remote_fd);
+        if (!(c->flags & CONN_FLAG_DEAD) && c->extra_fd != INVALID_SOCK)
+          on_readable(c, c->extra_fd);
+      }
+      if (is_write && !(c->flags & CONN_FLAG_DEAD)) {
+        if (c->client_fd != INVALID_SOCK)
+          on_writable(c, c->client_fd);
+        if (!(c->flags & CONN_FLAG_DEAD) && c->remote_fd != INVALID_SOCK)
+          on_writable(c, c->remote_fd);
+      }
 #endif
     }
 
